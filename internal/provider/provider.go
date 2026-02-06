@@ -182,16 +182,19 @@ func (p *AppHostingProvider) RunInContainer(ctx context.Context, namespace strin
 // This follows the NaiveNodeProvider pattern from virtual-kubelet.
 // The library's NodeController handles periodic heartbeat updates automatically.
 type AppHostingNode struct {
-	driver drivers.CiscoKubernetesDeviceDriver
+	driver         drivers.CiscoKubernetesDeviceDriver
+	nodeInternalIP string
 }
 
 // NewAppHostingNode creates a new AppHostingNode with a shared driver
 func NewAppHostingNode(
 	ctx context.Context,
 	driver drivers.CiscoKubernetesDeviceDriver,
+	nodeInternalIP string,
 ) (*AppHostingNode, error) {
 	return &AppHostingNode{
-		driver: driver,
+		driver:         driver,
+		nodeInternalIP: nodeInternalIP,
 	}, nil
 }
 
@@ -222,8 +225,8 @@ func (a *AppHostingNode) NotifyNodeStatus(ctx context.Context, cb func(*v1.Node)
 
 	log.G(ctx).Info("Updating node status with device info")
 
-	// Create a node update with device info
-	cb(&v1.Node{
+	// Create a node update with device info and addresses
+	nodeUpdate := &v1.Node{
 		Status: v1.NodeStatus{
 			NodeInfo: v1.NodeSystemInfo{
 				MachineID:       deviceInfo.SerialNumber,
@@ -234,5 +237,17 @@ func (a *AppHostingNode) NotifyNodeStatus(ctx context.Context, cb func(*v1.Node)
 				OperatingSystem: "linux",
 			},
 		},
-	})
+	}
+
+	// Include InternalIP address if configured
+	if a.nodeInternalIP != "" {
+		nodeUpdate.Status.Addresses = []v1.NodeAddress{
+			{
+				Type:    v1.NodeInternalIP,
+				Address: a.nodeInternalIP,
+			},
+		}
+	}
+
+	cb(nodeUpdate)
 }
