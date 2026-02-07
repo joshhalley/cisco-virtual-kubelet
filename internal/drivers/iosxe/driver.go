@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/cisco/virtual-kubelet-cisco/internal/config"
@@ -43,6 +44,7 @@ type XEDriver struct {
 	client       common.NetworkClient
 	marshaller   func(any) ([]byte, error)
 	unmarshaller UnmarshalFunc
+	deviceInfo   *common.DeviceInfo
 }
 
 // NewAppHostingDriver creates a new IOS-XE AppHosting driver instance
@@ -174,7 +176,7 @@ func (d *XEDriver) getRestconfUnmarshaller() UnmarshalFunc {
 	}
 }
 
-// CheckConnection validates connectivity to the device
+// CheckConnection validates connectivity to the device and fetches device info
 func (d *XEDriver) CheckConnection(ctx context.Context) error {
 	res := &common.HostMeta{}
 
@@ -184,7 +186,65 @@ func (d *XEDriver) CheckConnection(ctx context.Context) error {
 	}
 
 	log.G(ctx).Debugf("Restconf Root: %s\n", res.Links[0].Href)
+
+	d.deviceInfo = d.fetchDeviceInfo(ctx)
 	return nil
+}
+
+func (d *XEDriver) fetchDeviceInfo(ctx context.Context) *common.DeviceInfo {
+	info := &common.DeviceInfo{}
+
+	resp := &Cisco_IOS_XEDeviceHardwareOper_DeviceHardwareData{}
+	err := d.client.Get(ctx, "/restconf/data/Cisco-IOS-XE-device-hardware-oper:device-hardware-data", resp, d.unmarshaller)
+	if err != nil {
+		log.G(ctx).WithError(err).Debug("Failed to fetch device hardware info")
+		return info
+	}
+
+	// Get software version from device-system-data and extract just the version number
+	if resp.DeviceHardware != nil && resp.DeviceHardware.DeviceSystemData != nil {
+		if resp.DeviceHardware.DeviceSystemData.SoftwareVersion != nil {
+			info.SoftwareVersion = parseVersionNumber(*resp.DeviceHardware.DeviceSystemData.SoftwareVersion)
+		}
+	}
+
+	// Find the chassis inventory entry for serial and part number
+	if resp.DeviceHardware != nil && resp.DeviceHardware.DeviceInventory != nil {
+		for _, inv := range resp.DeviceHardware.DeviceInventory {
+			if inv.HwType == Cisco_IOS_XEDeviceHardwareOper_HwType_hw_type_chassis && inv.SerialNumber != nil && *inv.SerialNumber != "" {
+				info.SerialNumber = *inv.SerialNumber
+				if inv.PartNumber != nil {
+					info.ProductID = *inv.PartNumber
+				}
+				break
+			}
+		}
+	}
+
+	if info.SerialNumber != "" {
+		log.G(ctx).Infof("Device info: Serial=%s, Version=%s, Product=%s",
+			info.SerialNumber, info.SoftwareVersion, info.ProductID)
+	}
+
+	return info
+}
+
+// parseVersionNumber extracts the version number (e.g., "17.18.2") from the full software-version string
+func parseVersionNumber(fullVersion string) string {
+	re := regexp.MustCompile(`Version\s+(\d+\.\d+\.\d+)`)
+	matches := re.FindStringSubmatch(fullVersion)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return fullVersion
+}
+
+// GetDeviceInfo returns cached device information
+func (d *XEDriver) GetDeviceInfo(ctx context.Context) (*common.DeviceInfo, error) {
+	if d.deviceInfo == nil {
+		return &common.DeviceInfo{}, nil
+	}
+	return d.deviceInfo, nil
 }
 
 // GetDeviceResources returns the available resources on the device

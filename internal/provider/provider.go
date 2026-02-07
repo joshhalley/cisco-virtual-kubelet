@@ -176,7 +176,9 @@ func (p *AppHostingProvider) RunInContainer(ctx context.Context, namespace strin
 // AppHostingNode implements node.NodeProvider for proper heartbeat management.
 // This follows the NaiveNodeProvider pattern from virtual-kubelet.
 // The library's NodeController handles periodic heartbeat updates automatically.
-type AppHostingNode struct{}
+type AppHostingNode struct {
+	appCfg *config.Config
+}
 
 // NewAppHostingNode creates a new AppHostingNode
 func NewAppHostingNode(
@@ -184,7 +186,9 @@ func NewAppHostingNode(
 	appCfg *config.Config,
 	vkCfg nodeutil.ProviderConfig,
 ) (*AppHostingNode, error) {
-	return &AppHostingNode{}, nil
+	return &AppHostingNode{
+		appCfg: appCfg,
+	}, nil
 }
 
 // Ping implements node.NodeProvider.
@@ -195,8 +199,59 @@ func (a *AppHostingNode) Ping(ctx context.Context) error {
 }
 
 // NotifyNodeStatus implements node.NodeProvider.
-// This is for async/event-driven status updates (e.g., device health changes).
-// The library's controlLoop handles periodic heartbeat updates automatically.
+// Called once at startup to allow async node status updates.
+// We use this to update node info with device details after driver initialization.
 func (a *AppHostingNode) NotifyNodeStatus(ctx context.Context, cb func(*v1.Node)) {
-	// No-op - library handles periodic updates via controlLoop and updateNodeStatusHeartbeat()
+	if a.appCfg == nil {
+		return
+	}
+
+	// Create a temporary driver to fetch device info
+	// Note: NewDriver calls CheckConnection internally, which populates deviceInfo
+	driver, err := drivers.NewDriver(ctx, &a.appCfg.Device)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to create driver for node status update")
+		return
+	}
+
+	deviceInfo, err := driver.GetDeviceInfo(ctx)
+	if err != nil || deviceInfo == nil {
+		return
+	}
+
+	// Only update if we have actual device info
+	if deviceInfo.SerialNumber == "" {
+		return
+	}
+
+	// Determine node internal IP: config value or device address
+	nodeInternalIP := a.appCfg.Kubelet.NodeInternalIP
+	if nodeInternalIP == "" {
+		nodeInternalIP = a.appCfg.Device.Address
+	}
+
+	log.G(ctx).Infof("Updating node status with device info, InternalIP=%s", nodeInternalIP)
+
+	// Create a node update with device info and addresses
+	nodeUpdate := &v1.Node{
+		Status: v1.NodeStatus{
+			NodeInfo: v1.NodeSystemInfo{
+				MachineID:       deviceInfo.SerialNumber,
+				SystemUUID:      deviceInfo.SerialNumber,
+				KernelVersion:   deviceInfo.SoftwareVersion,
+				KubeletVersion:  getVirtualKubeletVersion(),
+				OSImage:         "IOS-XE",
+				Architecture:    deviceInfo.ProductID,
+				OperatingSystem: "Cisco",
+			},
+			Addresses: []v1.NodeAddress{
+				{
+					Type:    v1.NodeInternalIP,
+					Address: nodeInternalIP,
+				},
+			},
+		},
+	}
+
+	cb(nodeUpdate)
 }

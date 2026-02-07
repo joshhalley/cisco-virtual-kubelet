@@ -15,6 +15,8 @@
 package provider
 
 import (
+	"runtime/debug"
+
 	"github.com/cisco/virtual-kubelet-cisco/internal/config"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -42,7 +44,7 @@ func GetInitialNodeSpec(config *config.Config) v1.Node {
 		Status: v1.NodeStatus{
 			Phase:      v1.NodeRunning,
 			Conditions: InitNodeConditions(),
-			NodeInfo:   InitNodeSystemInfo(config),
+			NodeInfo:   InitNodeSystemInfo(),
 			Capacity:   initNodeCapacity(),
 			Addresses: []v1.NodeAddress{
 				{
@@ -112,14 +114,27 @@ func InitNodeConditions() []v1.NodeCondition {
 	}
 }
 
-func InitNodeSystemInfo(config *config.Config) v1.NodeSystemInfo {
-	// TODO Update this from driver information
+func InitNodeSystemInfo() v1.NodeSystemInfo {
 	return v1.NodeSystemInfo{
-		KubeletVersion:          "v2.00",
-		OSImage:                 "Cisco IOSXE",
-		KernelVersion:           "__cisco_ios__",
-		ContainerRuntimeVersion: "cisco.app.hosting",
+		Architecture:            "unknown",
+		OperatingSystem:         "unknown",
+		KubeletVersion:          getVirtualKubeletVersion(),
+		ContainerRuntimeVersion: "unknown",
+		OSImage:                 "unknown",
 	}
+}
+
+func getVirtualKubeletVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "github.com/virtual-kubelet/virtual-kubelet" {
+			return dep.Version
+		}
+	}
+	return "unknown"
 }
 
 func initNodeCapacity() v1.ResourceList {
