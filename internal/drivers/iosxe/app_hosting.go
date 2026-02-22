@@ -24,8 +24,15 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 )
 
+// createAppWaitTimeout is the maximum time to wait for each state transition
+// during app creation. IOS-XE devices (especially C8000V) can take significant
+// time to transition between states during install, activate, and start.
+const createAppWaitTimeout = 120 * time.Second
+
 // CreateAppHostingApp creates a single IOS-XE AppHosting app from an AppHostingConfig.
-// This function configures the app on the device and initiates the installation process.
+// This function configures the app on the device and drives it through the full
+// lifecycle: configure → install → activate → start, waiting for each state
+// transition to complete before proceeding.
 func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHostingConfig) error {
 	log.G(ctx).Infof("Creating AppHosting app: %s for container: %s", appConfig.AppName, appConfig.ContainerName)
 
@@ -45,7 +52,32 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 		return fmt.Errorf("failed to install app %s: %w", appConfig.AppName, err)
 	}
 
-	log.G(ctx).Infof("Successfully created and installed app %s", appConfig.AppName)
+	// Wait for the app to reach DEPLOYED status after install
+	if err := d.WaitForAppStatus(ctx, appConfig.AppName, "DEPLOYED", createAppWaitTimeout); err != nil {
+		return fmt.Errorf("app %s failed to reach DEPLOYED status after install: %w", appConfig.AppName, err)
+	}
+
+	// Activate the app
+	if err := d.ActivateApp(ctx, appConfig.AppName); err != nil {
+		return fmt.Errorf("failed to activate app %s: %w", appConfig.AppName, err)
+	}
+
+	// Wait for the app to reach ACTIVATED status
+	if err := d.WaitForAppStatus(ctx, appConfig.AppName, "ACTIVATED", createAppWaitTimeout); err != nil {
+		return fmt.Errorf("app %s failed to reach ACTIVATED status after activate: %w", appConfig.AppName, err)
+	}
+
+	// Start the app
+	if err := d.StartApp(ctx, appConfig.AppName); err != nil {
+		return fmt.Errorf("failed to start app %s: %w", appConfig.AppName, err)
+	}
+
+	// Wait for the app to reach RUNNING status
+	if err := d.WaitForAppStatus(ctx, appConfig.AppName, "RUNNING", createAppWaitTimeout); err != nil {
+		return fmt.Errorf("app %s failed to reach RUNNING status after start: %w", appConfig.AppName, err)
+	}
+
+	log.G(ctx).Infof("Successfully created and started app %s", appConfig.AppName)
 	return nil
 }
 
