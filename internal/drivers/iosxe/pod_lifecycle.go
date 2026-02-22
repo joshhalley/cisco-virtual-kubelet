@@ -25,13 +25,18 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// DeployPod creates and deploys all containers in a pod to the device
+// DeployPod creates and deploys all containers in a pod to the device.
+// Operations are serialized via a lifecycle lock to prevent concurrent
+// RESTCONF write operations from overwhelming the IOS-XE device.
 func (d *XEDriver) DeployPod(ctx context.Context, pod *v1.Pod) error {
-	log.G(ctx).WithFields(log.Fields{
-		"pod": pod,
-	}).Debug("Pod DeployContainer request received")
+	log.G(ctx).Infof("Deploying pod: %s/%s (waiting for device lock)", pod.Namespace, pod.Name)
 
-	log.G(ctx).Infof("Deploying pod: %s/%s", pod.Namespace, pod.Name)
+	if err := d.acquireLifecycleLock(ctx); err != nil {
+		return fmt.Errorf("failed to acquire device lock for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	defer d.releaseLifecycleLock()
+
+	log.G(ctx).Infof("Deploying pod: %s/%s (device lock acquired)", pod.Namespace, pod.Name)
 
 	// Convert pod spec to app hosting configurations
 	appConfigs, err := d.ConvertPodToAppConfigs(pod)
@@ -157,11 +162,18 @@ func (d *XEDriver) GetPodContainers(ctx context.Context, pod *v1.Pod) (map[strin
 	return containerToAppID, nil
 }
 
-// DeletePod removes all containers in a pod from the device
+// DeletePod removes all containers in a pod from the device.
+// Operations are serialized via a lifecycle lock to prevent concurrent
+// RESTCONF write operations from overwhelming the IOS-XE device.
 func (d *XEDriver) DeletePod(ctx context.Context, pod *v1.Pod) error {
-	log.G(ctx).WithFields(log.Fields{
-		"pod": pod,
-	}).Debugf("DeletePod request received for pod: %s", pod.Name)
+	log.G(ctx).Infof("Deleting pod: %s/%s (waiting for device lock)", pod.Namespace, pod.Name)
+
+	if err := d.acquireLifecycleLock(ctx); err != nil {
+		return fmt.Errorf("failed to acquire device lock for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	defer d.releaseLifecycleLock()
+
+	log.G(ctx).Infof("Deleting pod: %s/%s (device lock acquired)", pod.Namespace, pod.Name)
 
 	// Get all containers for this pod
 	discoveredContainers, err := d.GetPodContainers(ctx, pod)

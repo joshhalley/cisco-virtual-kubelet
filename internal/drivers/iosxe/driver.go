@@ -45,6 +45,7 @@ type XEDriver struct {
 	marshaller   func(any) ([]byte, error)
 	unmarshaller UnmarshalFunc
 	deviceInfo   *common.DeviceInfo
+	lifecycleSem chan struct{} // serializes lifecycle operations (deploy/delete) against the device
 }
 
 // NewAppHostingDriver creates a new IOS-XE AppHosting driver instance
@@ -101,8 +102,9 @@ func NewAppHostingDriver(ctx context.Context, spec *v1alpha1.DeviceSpec) (*XEDri
 	)
 
 	d := &XEDriver{
-		config: spec,
-		client: Client,
+		config:       spec,
+		client:       Client,
+		lifecycleSem: make(chan struct{}, 1),
 	}
 
 	protocol := "restconf"
@@ -121,6 +123,25 @@ func NewAppHostingDriver(ctx context.Context, spec *v1alpha1.DeviceSpec) (*XEDri
 	}).Info("Connected to IOSXE device")
 
 	return d, nil
+}
+
+// acquireLifecycleLock blocks until the device is available for a lifecycle
+// operation (deploy/delete), or the context is cancelled. This prevents
+// concurrent write operations from overwhelming the IOS-XE RESTCONF API,
+// which processes configuration changes largely serially.
+func (d *XEDriver) acquireLifecycleLock(ctx context.Context) error {
+	select {
+	case d.lifecycleSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("context cancelled while waiting for device lock: %w", ctx.Err())
+	}
+}
+
+// releaseLifecycleLock releases the device lifecycle lock, allowing the next
+// queued lifecycle operation to proceed.
+func (d *XEDriver) releaseLifecycleLock() {
+	<-d.lifecycleSem
 }
 
 // gethostMetaUnmarshaller returns an unmarshaller for host-meta XML responses
