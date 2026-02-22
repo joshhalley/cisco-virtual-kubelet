@@ -38,45 +38,24 @@ func (d *XEDriver) DeployPod(ctx context.Context, pod *v1.Pod) error {
 
 	log.G(ctx).Infof("Deploying pod: %s/%s (device lock acquired)", pod.Namespace, pod.Name)
 
-	// Check for existing containers from a previous failed attempt and clean them up
+	// Idempotency check: if all containers already exist and are RUNNING
+	// (e.g., CreatePod retried after a previous success), return early.
 	existingContainers, _ := d.GetPodContainers(ctx, pod)
 	if len(existingContainers) > 0 {
-		log.G(ctx).Infof("Found %d existing containers for pod %s/%s, checking state", len(existingContainers), pod.Namespace, pod.Name)
-
 		allAppOperData, err := d.GetAppOperationalData(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to fetch app operational data during cleanup: %w", err)
-		}
-
-		allRunning := true
-		for containerName, appID := range existingContainers {
-			operData, hasOperData := allAppOperData[appID]
-
-			if hasOperData && operData.Details != nil && operData.Details.State != nil && *operData.Details.State == "RUNNING" {
-				log.G(ctx).Infof("Container %s (app %s) is already RUNNING, skipping", containerName, appID)
-				continue
-			}
-
-			allRunning = false
-
-			if hasOperData {
-				// Has oper data but not RUNNING — full cleanup
-				log.G(ctx).Infof("Container %s (app %s) has oper data but is not RUNNING, performing full cleanup", containerName, appID)
-				if err := d.DeleteApp(ctx, appID); err != nil {
-					log.G(ctx).Warnf("Failed to clean up stale app %s: %v", appID, err)
-				}
-			} else {
-				// Config orphan — just delete the config entry
-				log.G(ctx).Infof("Container %s (app %s) is a config orphan (no oper data), removing config", containerName, appID)
-				if err := d.deleteAppConfig(ctx, appID); err != nil {
-					log.G(ctx).Warnf("Failed to delete orphaned config for app %s: %v", appID, err)
+		if err == nil {
+			allRunning := true
+			for _, appID := range existingContainers {
+				operData, hasOperData := allAppOperData[appID]
+				if !hasOperData || operData.Details == nil || operData.Details.State == nil || *operData.Details.State != "RUNNING" {
+					allRunning = false
+					break
 				}
 			}
-		}
-
-		if allRunning {
-			log.G(ctx).Infof("All containers for pod %s/%s are already RUNNING, nothing to deploy", pod.Namespace, pod.Name)
-			return nil
+			if allRunning {
+				log.G(ctx).Infof("All containers for pod %s/%s are already RUNNING, nothing to deploy", pod.Namespace, pod.Name)
+				return nil
+			}
 		}
 	}
 
@@ -102,9 +81,81 @@ func (d *XEDriver) DeployPod(ctx context.Context, pod *v1.Pod) error {
 	return nil
 }
 
-// UpdatePod handles pod update requests
+// UpdatePod reconciles an existing pod on the device. It checks each container's
+// state and recovers any that are not RUNNING by cleaning them up and redeploying.
+// If all containers are already RUNNING, it returns early as a no-op.
 func (d *XEDriver) UpdatePod(ctx context.Context, pod *v1.Pod) error {
-	log.G(ctx).Info("Pod UpdateContainer request received")
+	log.G(ctx).Infof("Updating pod: %s/%s (waiting for device lock)", pod.Namespace, pod.Name)
+
+	if err := d.acquireLifecycleLock(ctx); err != nil {
+		return fmt.Errorf("failed to acquire device lock for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	defer d.releaseLifecycleLock()
+
+	log.G(ctx).Infof("Updating pod: %s/%s (device lock acquired)", pod.Namespace, pod.Name)
+
+	// Get existing containers for this pod
+	existingContainers, _ := d.GetPodContainers(ctx, pod)
+	if len(existingContainers) == 0 {
+		log.G(ctx).Warnf("UpdatePod called for pod %s/%s but no containers found on device", pod.Namespace, pod.Name)
+		return nil
+	}
+
+	// Fetch operational data to determine each container's state
+	allAppOperData, err := d.GetAppOperationalData(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch app operational data: %w", err)
+	}
+
+	allRunning := true
+	for containerName, appID := range existingContainers {
+		operData, hasOperData := allAppOperData[appID]
+
+		if hasOperData && operData.Details != nil && operData.Details.State != nil && *operData.Details.State == "RUNNING" {
+			log.G(ctx).Infof("Container %s (app %s) is RUNNING, skipping", containerName, appID)
+			continue
+		}
+
+		allRunning = false
+
+		if hasOperData {
+			// Has oper data but not RUNNING — full cleanup
+			log.G(ctx).Infof("Container %s (app %s) has oper data but is not RUNNING, performing full cleanup", containerName, appID)
+			if err := d.DeleteApp(ctx, appID); err != nil {
+				log.G(ctx).Warnf("Failed to clean up broken app %s: %v", appID, err)
+			}
+		} else {
+			// Config orphan — just delete the config entry
+			log.G(ctx).Infof("Container %s (app %s) is a config orphan (no oper data), removing config", containerName, appID)
+			if err := d.deleteAppConfig(ctx, appID); err != nil {
+				log.G(ctx).Warnf("Failed to delete orphaned config for app %s: %v", appID, err)
+			}
+		}
+	}
+
+	if allRunning {
+		log.G(ctx).Infof("All containers for pod %s/%s are RUNNING, nothing to update", pod.Namespace, pod.Name)
+		return nil
+	}
+
+	// Redeploy containers that were cleaned up
+	appConfigs, err := d.ConvertPodToAppConfigs(pod)
+	if err != nil {
+		return fmt.Errorf("failed to convert pod to app configs: %w", err)
+	}
+
+	for _, appConfig := range appConfigs {
+		log.G(ctx).Infof("Redeploying app: %s for container: %s", appConfig.AppName, appConfig.ContainerName)
+
+		err = d.CreateAppHostingApp(ctx, appConfig)
+		if err != nil {
+			return fmt.Errorf("failed to deploy app for container %s: %w", appConfig.ContainerName, err)
+		}
+
+		log.G(ctx).Infof("Successfully redeployed app %s for container %s", appConfig.AppName, appConfig.ContainerName)
+	}
+
+	log.G(ctx).Infof("Successfully updated pod: %s/%s", pod.Namespace, pod.Name)
 	return nil
 }
 
@@ -303,14 +354,6 @@ func (d *XEDriver) GetPodStatus(ctx context.Context, pod *v1.Pod) (*v1.Pod, erro
 		} else {
 			log.G(ctx).Warnf("App %s for container %s configured but no operational data found", appID, containerName)
 		}
-	}
-
-	// If none of the pod's containers have operational data, the pod doesn't
-	// meaningfully exist on the device (config-only orphan). Return not-found
-	// so the framework re-routes to CreatePod instead of UpdatePod.
-	if len(appOperDataMap) == 0 {
-		log.G(ctx).Warnf("Pod %s/%s has config on device but no operational data — treating as not found", pod.Namespace, pod.Name)
-		return nil, fmt.Errorf("pod %s/%s has config but no operational data on device", pod.Namespace, pod.Name)
 	}
 
 	// Create a copy of the pod and update its status
