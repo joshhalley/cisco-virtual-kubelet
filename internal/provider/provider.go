@@ -123,10 +123,14 @@ func (p *AppHostingProvider) GetPodStatus(ctx context.Context, namespace, name s
 		return nil, errdefs.NotFound(fmt.Sprintf("pod %s/%s not found: %v", namespace, name, err))
 	}
 
-	// Get actual status from Cisco device
+	// Get actual status from Cisco device.
+	// IMPORTANT: Do NOT wrap this error as NotFound. The framework's status sync
+	// (sync.go) treats NotFound specially — it marks the pod as Phase=Failed,
+	// which causes the reconciler to skip it. A plain error is simply logged,
+	// leaving the pod status unchanged so the reconciler can still CreatePod.
 	statusPod, err := p.driver.GetPodStatus(p.ctx, pod)
 	if err != nil {
-		return nil, errdefs.AsNotFound(err)
+		return nil, fmt.Errorf("failed to get pod status from device: %w", err)
 	}
 
 	return &statusPod.Status, nil
