@@ -398,6 +398,11 @@ func TestConvertPodToAppConfigs_SingleContainer_DHCP(t *testing.T) {
 		t.Errorf("Expected image path 'nginx:latest', got %s", config.ImagePath)
 	}
 
+	// Verify PackageDest is empty when annotation is not set
+	if config.PackageDest != "" {
+		t.Errorf("Expected PackageDest to be empty when annotation is not set, got %q", config.PackageDest)
+	}
+
 	// Verify app name format (should contain cleaned UID)
 	expectedUIDPart := "123456781234123412"
 	if !strings.Contains(config.AppName, expectedUIDPart) {
@@ -581,6 +586,41 @@ func TestConvertPodToAppConfigs_MultipleContainers_StaticIP(t *testing.T) {
 	}
 	if app1.ApplicationNetworkResource.VirtualportgroupGuestIpAddress_1 != nil {
 		t.Error("Expected VirtualportgroupGuestIpAddress_1 to be nil for non-primary container")
+	}
+}
+
+func TestConvertPodToAppConfigs_PackageDestAnnotation(t *testing.T) {
+	driver := &XEDriver{
+		config: &v1alpha1.DeviceSpec{},
+	}
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			UID:       "12345678-1234-1234-1234-123456789abc",
+			Annotations: map[string]string{
+				podAnnotationIOSXEAppHostPackageDest: "flash:/virtual-kubelet/custom.tar",
+			},
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Name:  "nginx",
+				Image: "nginx:latest",
+			}},
+		},
+	}
+
+	configs, err := driver.ConvertPodToAppConfigs(pod)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	if len(configs) != 1 {
+		t.Fatalf("Expected 1 config, got %d", len(configs))
+	}
+
+	if configs[0].PackageDest != "flash:/virtual-kubelet/custom.tar" {
+		t.Fatalf("Expected PackageDest to be propagated, got %q", configs[0].PackageDest)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"github.com/cisco/virtual-kubelet-cisco/internal/drivers/common"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	v1 "k8s.io/api/core/v1"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -62,7 +63,7 @@ func (d *FAKEDriver) GetDeviceInfo(ctx context.Context) (*common.DeviceInfo, err
 	}, nil
 }
 
-func (d *FAKEDriver) DeployPod(ctx context.Context, pod *v1.Pod) error {
+func (d *FAKEDriver) DeployPod(ctx context.Context, pod *v1.Pod, secretLister corev1listers.SecretNamespaceLister) error {
 	containerAppIDs := common.GenerateContainerAppIDs(pod)
 
 	log.G(ctx).WithFields(log.Fields{

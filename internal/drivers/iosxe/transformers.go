@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 
 	"github.com/cisco/virtual-kubelet-cisco/api/v1alpha1"
@@ -59,10 +60,13 @@ type resourceConfig struct {
 
 // AppHostingConfig represents a complete IOS-XE AppHosting configuration for a single container
 type AppHostingConfig struct {
-	AppName       string
-	ContainerName string
-	ImagePath     string
-	Apps          *Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps
+	AppName          string
+	ContainerName    string
+	ImagePath        string
+	ImagePullPolicy  v1.PullPolicy
+	PackageDest      string
+	ImagePullSecrets []v1.LocalObjectReference
+	Apps             *Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps
 }
 
 // ConvertPodToAppConfigs converts a Kubernetes Pod spec into a slice of IOS-XE AppHosting configurations.
@@ -71,6 +75,11 @@ type AppHostingConfig struct {
 func (d *XEDriver) ConvertPodToAppConfigs(pod *v1.Pod) ([]AppHostingConfig, error) {
 	containerAppIDs := common.GenerateContainerAppIDs(pod)
 	configs := make([]AppHostingConfig, 0, len(pod.Spec.Containers))
+
+	packageDest, err := getIOSXEAppHostPackageDest(pod)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, container := range pod.Spec.Containers {
 		appName := containerAppIDs[container.Name]
@@ -230,14 +239,49 @@ func (d *XEDriver) ConvertPodToAppConfigs(pod *v1.Pod) ([]AppHostingConfig, erro
 
 		// Add to configs slice
 		configs = append(configs, AppHostingConfig{
-			AppName:       appName,
-			ContainerName: container.Name,
-			ImagePath:     container.Image,
-			Apps:          apps,
+			AppName:          appName,
+			ContainerName:    container.Name,
+			ImagePath:        container.Image,
+			ImagePullPolicy:  container.ImagePullPolicy,
+			PackageDest:      packageDest,
+			ImagePullSecrets: pod.Spec.ImagePullSecrets,
+			Apps:             apps,
 		})
 	}
 
 	return configs, nil
+}
+
+func getIOSXEAppHostPackageDest(pod *v1.Pod) (string, error) {
+	if pod == nil {
+		return "", nil
+	}
+	if pod.Annotations == nil {
+		return "", nil
+	}
+
+	dest, ok := pod.Annotations[podAnnotationIOSXEAppHostPackageDest]
+	if !ok {
+		return "", nil
+	}
+
+	dest = strings.TrimSpace(dest)
+	if dest == "" {
+		return "", nil
+	}
+
+	// Conservative validation: IOS-XE file systems like bootflash:/, harddisk:/, flash:/, nvram:/
+	// Keep this intentionally restrictive to avoid passing arbitrary schemes into device operations.
+	valid := regexp.MustCompile(`^(bootflash:|harddisk:|flash:|nvram:|usb:)/.+`) // e.g. bootflash:/dir/file.tar
+	if !valid.MatchString(dest) {
+		return "", fmt.Errorf(
+			"invalid %s annotation %q: expected e.g. flash:/virtual-kubelet/app.tar",
+			podAnnotationIOSXEAppHostPackageDest,
+			dest,
+		)
+	}
+
+	return dest, nil
 }
 
 // getNetworkConfig converts pod/container specs to IOS-XE network configuration

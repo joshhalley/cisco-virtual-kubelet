@@ -16,12 +16,16 @@ package iosxe
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
+	v1 "k8s.io/api/core/v1"
 )
 
 // CreateAppHostingApp creates a single IOS-XE AppHosting app from an AppHostingConfig.
@@ -39,9 +43,9 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 
 	log.G(ctx).Infof("AppHosting app %s successfully configured", appConfig.AppName)
 
-	// Install the app package
-	err = d.InstallApp(ctx, appConfig.AppName, appConfig.ImagePath)
-	if err != nil {
+	// Install the app package. If install fails and imagePullPolicy allows, attempt recovery
+	// by pulling/copying the image and retrying install once.
+	if err := d.installWithRecovery(ctx, appConfig); err != nil {
 		return fmt.Errorf("failed to install app %s: %w", appConfig.AppName, err)
 	}
 
@@ -71,6 +75,32 @@ func (d *XEDriver) appHostingRPC(ctx context.Context, operation string, appID st
 	return nil
 }
 
+type iosxeCopyRPCRequest struct {
+	Source      string `json:"source-drop-node-name"`
+	Destination string `json:"destination-drop-node-name"`
+}
+
+func (d *XEDriver) copyRPC(ctx context.Context, source string, destination string) error {
+	payload := map[string]iosxeCopyRPCRequest{
+		"Cisco-IOS-XE-rpc:copy": {
+			Source:      source,
+			Destination: destination,
+		},
+	}
+
+	path := "/restconf/operations/Cisco-IOS-XE-rpc:copy"
+
+	jsonMarshaller := func(v any) ([]byte, error) {
+		return json.Marshal(v)
+	}
+
+	if err := d.client.Post(ctx, path, payload, jsonMarshaller); err != nil {
+		return fmt.Errorf("copy operation failed (source=%s destination=%s): %w", source, destination, err)
+	}
+
+	return nil
+}
+
 // InstallApp installs an app package on the device
 func (d *XEDriver) InstallApp(ctx context.Context, appID string, packagePath string) error {
 	log.G(ctx).Infof("Installing app %s from package: %s", appID, packagePath)
@@ -82,6 +112,216 @@ func (d *XEDriver) InstallApp(ctx context.Context, appID string, packagePath str
 
 	log.G(ctx).Infof("Successfully installed app %s", appID)
 	return nil
+}
+
+func (d *XEDriver) installWithRecovery(ctx context.Context, appConfig AppHostingConfig) error {
+	// First attempt: install using the image path as provided (current behavior).
+	err := d.InstallApp(ctx, appConfig.AppName, appConfig.ImagePath)
+	if err == nil {
+		return nil
+	}
+
+	// Recovery path should be driven by imagePullPolicy.
+	// Kubernetes defaulting: if empty, default is PullIfNotPresent.
+	policy := appConfig.ImagePullPolicy
+	if policy == "" {
+		policy = "IfNotPresent"
+	}
+
+	// If user explicitly says never pull, do not attempt recovery.
+	if policy == "Never" {
+		return err
+	}
+
+	log.G(ctx).Warnf("Install failed for app %s, attempting image recovery (policy=%s): %v", appConfig.AppName, policy, err)
+
+	// Attempt a best-effort recovery:
+	// - determine on-device package destination (annotation value propagated into appConfig.PackageDest)
+	// - if ImagePath is HTTP(S), try device-side fetch via IOS-XE copy RPC (optionally applying basic auth)
+	// - retry app-hosting install once using the on-device destination file
+	//
+	// Known gaps:
+	// - non-HTTP sources (e.g., local tar path) are not uploaded yet
+	// - token-based auth is parsed but not applied to the device fetch currently
+	//
+	// Destination defaulting:
+	// if PackageDest is not set, default to flash:/virtual-kubelet/<app>.tar
+	dest := appConfig.PackageDest
+	if dest == "" {
+		dest = fmt.Sprintf("flash:/virtual-kubelet/%s.tar", appConfig.AppName)
+	}
+	log.G(ctx).Infof("Install recovery destination for app %s: %s", appConfig.AppName, dest)
+
+	// If the image path is already something the device can fetch (URL), try a device-side copy to dest.
+	// This matches the desired "device pulls" behavior via IOS-XE copy RPC.
+	copySrc := appConfig.ImagePath
+	if isHTTPURL(copySrc) {
+		src := copySrc
+		if d.secretLister != nil && len(appConfig.ImagePullSecrets) > 0 {
+			if u, err := d.maybeAddAuthToURL(ctx, src, appConfig.ImagePullSecrets); err != nil {
+				log.G(ctx).Warnf("Failed to apply imagePullSecrets auth for app %s: %v", appConfig.AppName, err)
+			} else if u != "" {
+				src = u
+			}
+		}
+
+		if err := d.copyRPC(ctx, src, dest); err != nil {
+			log.G(ctx).Warnf("Image recovery copy failed for app %s (src=%s dest=%s): %v", appConfig.AppName, src, dest, err)
+		} else {
+			log.G(ctx).Infof("Image recovery copy succeeded for app %s (dest=%s)", appConfig.AppName, dest)
+			// Retry install using the on-device destination file.
+			return d.InstallApp(ctx, appConfig.AppName, dest)
+		}
+	}
+
+	// Best-effort retry with original packagePath (current behavior).
+	return d.InstallApp(ctx, appConfig.AppName, appConfig.ImagePath)
+}
+
+const (
+	podAnnotationIOSXEAppHostPackageDest = "virtual-kubelet.cisco.com/iosxe-apphost-package-dest"
+)
+
+func isHTTPURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+type registryAuth struct {
+	Username string
+	Password string
+	Token    string
+}
+
+func (d *XEDriver) maybeAddAuthToURL(ctx context.Context, srcURL string, pullSecrets []v1.LocalObjectReference) (string, error) {
+	// NOTE: This is a best-effort approach. IOS-XE copy RPC supports http(s) sources, but
+	// how it consumes credentials depends on platform capabilities.
+	//
+	// We currently implement the most transport-agnostic method: embed basic auth in the URL
+	// when available. Token auth is extracted for future use but not applied (no standard URL form).
+
+	auth, err := d.resolveAuthFromPullSecrets(ctx, pullSecrets)
+	if err != nil {
+		return "", err
+	}
+	if auth == nil {
+		return "", nil
+	}
+
+	// Prefer basic auth if available.
+	if auth.Username == "" {
+		return "", nil
+	}
+
+	// Only apply to http(s).
+	if !isHTTPURL(srcURL) {
+		return "", nil
+	}
+
+	u, err := url.Parse(srcURL)
+	if err != nil {
+		return "", err
+	}
+
+	// Do not override if already present.
+	if u.User != nil {
+		return "", nil
+	}
+
+	u.User = url.UserPassword(auth.Username, auth.Password)
+	return u.String(), nil
+}
+
+func (d *XEDriver) resolveAuthFromPullSecrets(ctx context.Context, pullSecrets []v1.LocalObjectReference) (*registryAuth, error) {
+	if d.secretLister == nil {
+		return nil, nil
+	}
+
+	for _, ref := range pullSecrets {
+		name := strings.TrimSpace(ref.Name)
+		if name == "" {
+			continue
+		}
+
+		secret, err := d.secretLister.Get(name)
+		if err != nil {
+			log.G(ctx).Debugf("imagePullSecret %q not found: %v", name, err)
+			continue
+		}
+
+		auth, err := authFromSecret(secret)
+		if err != nil {
+			log.G(ctx).Debugf("imagePullSecret %q could not be parsed: %v", name, err)
+			continue
+		}
+		if auth != nil {
+			return auth, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func authFromSecret(secret *v1.Secret) (*registryAuth, error) {
+	if secret == nil {
+		return nil, nil
+	}
+
+	// Prefer service-account style token if present.
+	// This does not map cleanly to URL/basic auth, but we capture it for future use.
+	if tok, ok := secret.Data["token"]; ok && len(tok) > 0 {
+		return &registryAuth{Token: strings.TrimSpace(string(tok))}, nil
+	}
+
+	// Docker config json secret.
+	// https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+	const dockerCfgKey = ".dockerconfigjson"
+	b, ok := secret.Data[dockerCfgKey]
+	if !ok || len(b) == 0 {
+		return nil, nil
+	}
+
+	var cfg struct {
+		Auths map[string]struct {
+			Auth     string `json:"auth"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+			IdentityToken string `json:"identitytoken"`
+			RegistryToken string `json:"registrytoken"`
+		} `json:"auths"`
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return nil, err
+	}
+
+	for _, a := range cfg.Auths {
+		// If identity token exists, prefer it.
+		if t := strings.TrimSpace(a.IdentityToken); t != "" {
+			return &registryAuth{Token: t}, nil
+		}
+		if t := strings.TrimSpace(a.RegistryToken); t != "" {
+			return &registryAuth{Token: t}, nil
+		}
+
+		user := strings.TrimSpace(a.Username)
+		pass := strings.TrimSpace(a.Password)
+		if user != "" {
+			return &registryAuth{Username: user, Password: pass, Token: ""}, nil
+		}
+
+		// Fallback to auth field if username/password not given.
+		if strings.TrimSpace(a.Auth) != "" {
+			decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(a.Auth))
+			if err != nil {
+				continue
+			}
+			parts := strings.SplitN(string(decoded), ":", 2)
+			if len(parts) == 2 {
+				return &registryAuth{Username: parts[0], Password: parts[1]}, nil
+			}
+		}
+	}
+
+	return nil, nil
 }
 
 // ActivateApp activates an installed app

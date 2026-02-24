@@ -23,15 +23,18 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 )
 
 // DeployPod creates and deploys all containers in a pod to the device
-func (d *XEDriver) DeployPod(ctx context.Context, pod *v1.Pod) error {
+func (d *XEDriver) DeployPod(ctx context.Context, pod *v1.Pod, secretLister corev1listers.SecretNamespaceLister) error {
 	log.G(ctx).WithFields(log.Fields{
 		"pod": pod,
 	}).Debug("Pod DeployContainer request received")
 
 	log.G(ctx).Infof("Deploying pod: %s/%s", pod.Namespace, pod.Name)
+
+	d.secretLister = secretLister
 
 	// Convert pod spec to app hosting configurations
 	appConfigs, err := d.ConvertPodToAppConfigs(pod)
