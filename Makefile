@@ -111,7 +111,7 @@ vet: ## Run go vet
 
 ## Code generation targets
 
-generate: crd-gen deepcopy-gen ## Run all code generators
+generate: crd-gen deepcopy-gen rbac-gen ## Run all code generators
 
 crd-gen: ## Generate CRDs from ./api (controller-gen)
 	@echo "Generating CRDs from ./api..."
@@ -125,6 +125,13 @@ deepcopy-gen: ## Generate DeepCopy methods for API types
 	$(GO_BIN) run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5 \
 		object \
 		paths=./api/...
+
+rbac-gen: ## Generate controller ClusterRole from +kubebuilder:rbac markers
+	@echo "Generating controller RBAC ClusterRole..."
+	$(GO_BIN) run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5 \
+		rbac:roleName=cisco-virtual-kubelet-controller \
+		paths=./internal/controller/... \
+		output:dir=./config/rbac
 
 ## Utility targets
 

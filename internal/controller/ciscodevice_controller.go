@@ -34,6 +34,10 @@ import (
 )
 
 const (
+	// ciscoDeviceFinalizer is added to every CiscoDevice so the controller can
+	// clean up the VK node before the object is removed from the API server.
+	ciscoDeviceFinalizer = "cisco.vk/device-cleanup"
+
 	// configMapSuffix is appended to the CiscoDevice name for the ConfigMap.
 	configMapSuffix = "-config"
 	// deploymentSuffix is appended to the CiscoDevice name for the Deployment.
@@ -64,6 +68,7 @@ type CiscoDeviceReconciler struct {
 // +kubebuilder:rbac:groups=cisco.vk,resources=ciscodevices/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;delete
 
 // Reconcile ensures a ConfigMap and Deployment exist for each CiscoDevice.
 func (r *CiscoDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -73,19 +78,42 @@ func (r *CiscoDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var device ciskov1.CiscoDevice
 	if err := r.Get(ctx, req.NamespacedName, &device); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("CiscoDevice deleted – owned resources will be garbage-collected")
+			logger.Info("CiscoDevice not found – already deleted")
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("unable to fetch CiscoDevice: %w", err)
 	}
 
-	// ── 2. Render the device config YAML ────────────────────────────────
+	// ── 2. Handle deletion (finalizer) ───────────────────────────────────
+	if !device.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&device, ciscoDeviceFinalizer) {
+			logger.Info("CiscoDevice deleted – cleaning up VK node", "node", device.Name)
+			if err := r.deleteNode(ctx, device.Name); err != nil {
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(&device, ciscoDeviceFinalizer)
+			if err := r.Update(ctx, &device); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// ── 3. Ensure finalizer is registered ───────────────────────────────
+	if !controllerutil.ContainsFinalizer(&device, ciscoDeviceFinalizer) {
+		controllerutil.AddFinalizer(&device, ciscoDeviceFinalizer)
+		if err := r.Update(ctx, &device); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to add finalizer: %w", err)
+		}
+	}
+
+	// ── 4. Render the device config YAML ────────────────────────────────
 	configData, err := renderDeviceConfig(&device.Spec)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to render device config: %w", err)
 	}
 
-	// ── 3. Reconcile the ConfigMap ──────────────────────────────────────
+	// ── 5. Reconcile the ConfigMap ──────────────────────────────────────
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      device.Name + configMapSuffix,
@@ -104,7 +132,7 @@ func (r *CiscoDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	logger.Info("ConfigMap reconciled", "name", cm.Name, "operation", op)
 
-	// ── 4. Reconcile the Deployment ─────────────────────────────────────
+	// ── 6. Reconcile the Deployment ─────────────────────────────────────
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      device.Name + deploymentSuffix,
@@ -187,7 +215,7 @@ func (r *CiscoDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	logger.Info("Deployment reconciled", "name", deploy.Name, "operation", op)
 
-	// ── 5. Update CiscoDevice status ────────────────────────────────────
+	// ── 7. Update CiscoDevice status ────────────────────────────────────
 	if err := r.updateStatus(ctx, &device, deploy); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -236,6 +264,26 @@ func shortHash(s string) string {
 		h *= 16777619
 	}
 	return fmt.Sprintf("%08x", h)
+}
+
+// deleteNode deletes the Kubernetes Node that the VK registered. The node is
+// cluster-scoped and cannot be owned by the namespaced CiscoDevice, so it
+// must be cleaned up explicitly via this finalizer path.
+func (r *CiscoDeviceReconciler) deleteNode(ctx context.Context, name string) error {
+	logger := log.FromContext(ctx)
+	node := &corev1.Node{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name}, node); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("VK node already absent", "node", name)
+			return nil
+		}
+		return fmt.Errorf("failed to get node %s: %w", name, err)
+	}
+	if err := r.Delete(ctx, node); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete node %s: %w", name, err)
+	}
+	logger.Info("Deleted VK node", "node", name)
+	return nil
 }
 
 // updateStatus patches the CiscoDevice status based on the Deployment state.
