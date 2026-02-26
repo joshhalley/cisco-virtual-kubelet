@@ -276,12 +276,13 @@ func getIOSXEAppHostPackageDest(pod *v1.Pod) (string, error) {
 		return "", nil
 	}
 
-	// Conservative validation: IOS-XE file systems like bootflash:/, harddisk:/, flash:/, nvram:/
+	// Conservative validation: IOS-XE file systems like bootflash:, harddisk:, flash:, nvram:
 	// Keep this intentionally restrictive to avoid passing arbitrary schemes into device operations.
-	valid := regexp.MustCompile(`^(bootflash:|harddisk:|flash:|nvram:|usb:)/.+`) // e.g. bootflash:/dir/file.tar
+	// Accepts both flash:file.tar and flash:/path/file.tar
+	valid := regexp.MustCompile(`^(bootflash:|harddisk:|flash:|nvram:|usb:)/?(.+)`) // e.g. flash:app.tar or flash:/dir/app.tar
 	if !valid.MatchString(dest) {
 		return "", fmt.Errorf(
-			"invalid %s annotation %q: expected e.g. flash:/virtual-kubelet/app.tar",
+			"invalid %s annotation %q: expected e.g. flash:app.tar or flash:/virtual-kubelet/app.tar",
 			podAnnotationIOSXEAppHostPackageDest,
 			dest,
 		)

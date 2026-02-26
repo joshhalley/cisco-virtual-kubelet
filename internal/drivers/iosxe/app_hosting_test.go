@@ -138,67 +138,6 @@ func TestAuthFromSecret_DockerConfigJSON_IdentityTokenPreferred(t *testing.T) {
 	}
 }
 
-func TestInstallWithRecovery_CopySuccessThenInstallDest(t *testing.T) {
-	calls := []string{}
-	client := &fakeNetworkClient{postHook: func(path string, payload any) error {
-		calls = append(calls, path)
-		if path == "/restconf/operations/Cisco-IOS-XE-rpc:app-hosting" {
-			// first install fails, second succeeds
-			if len(calls) == 1 {
-				return errors.New("install failed")
-			}
-			return nil
-		}
-		if path == "/restconf/operations/Cisco-IOS-XE-rpc:copy" {
-			return nil
-		}
-		return nil
-	}}
-
-	d := &XEDriver{client: client, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}}
-	cfg := AppHostingConfig{AppName: "app1", ImagePath: "https://example.com/app.tar", ImagePullPolicy: "Always"}
-
-	if err := d.installWithRecovery(context.Background(), cfg); err != nil {
-		t.Fatalf("expected success, got %v", err)
-	}
-
-	// expect install, copy, install
-	if len(calls) != 3 {
-		t.Fatalf("expected 3 calls, got %d: %v", len(calls), calls)
-	}
-	if calls[0] != "/restconf/operations/Cisco-IOS-XE-rpc:app-hosting" ||
-		calls[1] != "/restconf/operations/Cisco-IOS-XE-rpc:copy" ||
-		calls[2] != "/restconf/operations/Cisco-IOS-XE-rpc:app-hosting" {
-		t.Fatalf("unexpected call sequence: %v", calls)
-	}
-}
-
-func TestInstallWithRecovery_CopyFailsThenRetryOriginalFails(t *testing.T) {
-	calls := []string{}
-	client := &fakeNetworkClient{postHook: func(path string, payload any) error {
-		calls = append(calls, path)
-		if path == "/restconf/operations/Cisco-IOS-XE-rpc:app-hosting" {
-			return errors.New("install failed")
-		}
-		if path == "/restconf/operations/Cisco-IOS-XE-rpc:copy" {
-			return errors.New("copy failed")
-		}
-		return nil
-	}}
-
-	d := &XEDriver{client: client, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}}
-	cfg := AppHostingConfig{AppName: "app1", ImagePath: "https://example.com/app.tar", ImagePullPolicy: "Always"}
-
-	if err := d.installWithRecovery(context.Background(), cfg); err == nil {
-		t.Fatalf("expected error")
-	}
-
-	// expect install, copy, install
-	if len(calls) != 3 {
-		t.Fatalf("expected 3 calls, got %d: %v", len(calls), calls)
-	}
-}
-
 // helper to build oper data with a given app name and state
 func makeOperData(appName string, state string) *Cisco_IOS_XEAppHostingOper_AppHostingOperData {
 	return &Cisco_IOS_XEAppHostingOper_AppHostingOperData{
@@ -210,6 +149,65 @@ func makeOperData(appName string, state string) *Cisco_IOS_XEAppHostingOper_AppH
 				},
 			},
 		},
+	}
+}
+
+func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
+	getCalls := 0
+	postCalls := []string{}
+	copyCalled := false
+
+	client := &fakeNetworkClient{
+		postHook: func(path string, payload any) error {
+			postCalls = append(postCalls, path)
+			if path == "/restconf/operations/Cisco-IOS-XE-rpc:copy" {
+				copyCalled = true
+			}
+			return nil
+		},
+		getHook: func(path string, result any) error {
+			getCalls++
+			root, ok := result.(*Cisco_IOS_XEAppHostingOper_AppHostingOperData)
+			if !ok {
+				return nil
+			}
+			// Before recovery: no oper data (timeout scenario)
+			// After recovery (copy called): return RUNNING
+			if copyCalled {
+				oper := makeOperData("testapp", "RUNNING")
+				*root = *oper
+			} else {
+				root.App = nil // no oper data = image not pulled
+			}
+			return nil
+		},
+		deleteHook: func(path string) error {
+			// Track that cleanup happened
+			return nil
+		},
+	}
+
+	d := &XEDriver{
+		client:       client,
+		secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}},
+	}
+
+	cfg := AppHostingConfig{
+		AppName:         "testapp",
+		ContainerName:   "test-container",
+		ImagePath:       "http://example.com/app.tar",
+		PackageTimeout:  5 * time.Second,
+		ImagePullPolicy: "Always", // Allow recovery
+		Apps:            &Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps{},
+	}
+
+	err := d.CreateAppHostingApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("expected success after recovery, got: %v", err)
+	}
+
+	if !copyCalled {
+		t.Fatal("expected copy RPC to be called during recovery, but it wasn't")
 	}
 }
 

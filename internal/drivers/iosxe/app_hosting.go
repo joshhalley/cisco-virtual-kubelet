@@ -43,9 +43,15 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 
 	log.G(ctx).Infof("AppHosting app %s successfully configured", appConfig.AppName)
 
-	// Install the app package. If install fails and imagePullPolicy allows, attempt recovery
-	// by pulling/copying the image and retrying install once.
-	if err := d.installWithRecovery(ctx, appConfig); err != nil {
+	// Install the app package and wait for RUNNING state.
+	// If the wait times out and imagePullPolicy allows, attempt recovery by using device-side copy.
+	timeout := appConfig.PackageTimeout
+	if timeout == 0 {
+		timeout = 180 * time.Second
+	}
+
+	// First attempt: install using the image path as provided (current behavior).
+	if err := d.InstallApp(ctx, appConfig.AppName, appConfig.ImagePath); err != nil {
 		return fmt.Errorf("failed to install app %s: %w", appConfig.AppName, err)
 	}
 
@@ -53,17 +59,94 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 	// The install RPC may return success before the device has actually pulled and started the app.
 	// Without this wait, we can report success even though the image was never fetched,
 	// resulting in pods that never come up and no retry being triggered.
-	timeout := appConfig.PackageTimeout
-	if timeout == 0 {
-		timeout = 180 * time.Second
-	}
 	log.G(ctx).Infof("Waiting for app %s to reach RUNNING state (timeout: %v)", appConfig.AppName, timeout)
-	if err := d.WaitForAppStatus(ctx, appConfig.AppName, "RUNNING", timeout); err != nil {
-		return fmt.Errorf("app %s did not reach RUNNING state after install: %w", appConfig.AppName, err)
+	waitErr := d.WaitForAppStatus(ctx, appConfig.AppName, "RUNNING", timeout)
+	if waitErr == nil {
+		// Success - app is RUNNING
+		log.G(ctx).Infof("Successfully created and installed app %s", appConfig.AppName)
+		return nil
 	}
 
-	log.G(ctx).Infof("Successfully created and installed app %s", appConfig.AppName)
-	return nil
+	// Wait timed out - attempt recovery via device-side copy if allowed by imagePullPolicy
+	log.G(ctx).Warnf("App %s did not reach RUNNING state after install: %v", appConfig.AppName, waitErr)
+
+	// Recovery path should be driven by imagePullPolicy.
+	// Kubernetes defaulting: if empty, default is PullIfNotPresent.
+	policy := appConfig.ImagePullPolicy
+	if policy == "" {
+		policy = "IfNotPresent"
+	}
+
+	// If user explicitly says never pull, do not attempt recovery.
+	if policy == "Never" {
+		return fmt.Errorf("app %s did not reach RUNNING state after install: %w", appConfig.AppName, waitErr)
+	}
+
+	log.G(ctx).Warnf("Attempting image recovery for app %s (policy=%s)", appConfig.AppName, policy)
+
+	// Attempt a best-effort recovery:
+	// - determine on-device package destination (annotation value propagated into appConfig.PackageDest)
+	// - if ImagePath is HTTP(S), try device-side fetch via IOS-XE copy RPC (optionally applying basic auth)
+	// - retry app-hosting install once using the on-device destination file
+	//
+	// Destination defaulting:
+	// if PackageDest is not set, default to flash:/virtual-kubelet/<app>.tar
+	dest := appConfig.PackageDest
+	if dest == "" {
+		dest = fmt.Sprintf("flash:/virtual-kubelet/%s.tar", appConfig.AppName)
+	}
+	log.G(ctx).Infof("Install recovery destination for app %s: %s", appConfig.AppName, dest)
+
+	// If the image path is already something the device can fetch (URL), try a device-side copy to dest.
+	copySrc := appConfig.ImagePath
+	if isHTTPURL(copySrc) {
+		src := copySrc
+		if d.secretLister != nil && len(appConfig.ImagePullSecrets) > 0 {
+			if u, err := d.maybeAddAuthToURL(ctx, src, appConfig.ImagePullSecrets); err != nil {
+				log.G(ctx).Warnf("Failed to apply imagePullSecrets auth for app %s: %v", appConfig.AppName, err)
+			} else if u != "" {
+				src = u
+			}
+		}
+
+		// First, stop and deactivate the failed app to clean up the stale install attempt
+		log.G(ctx).Infof("Cleaning up failed install for app %s before recovery", appConfig.AppName)
+		if err := d.DeleteApp(ctx, appConfig.AppName); err != nil {
+			log.G(ctx).Warnf("Failed to clean up app %s before recovery: %v (continuing anyway)", appConfig.AppName, err)
+		}
+
+		// Re-post the config (DeleteApp removes it)
+		log.G(ctx).Infof("Re-posting config for app %s before recovery", appConfig.AppName)
+		configPath := "/restconf/data/Cisco-IOS-XE-app-hosting-cfg:app-hosting-cfg-data/apps"
+		if err := d.client.Post(ctx, configPath, appConfig.Apps, d.marshaller); err != nil {
+			return fmt.Errorf("failed to re-post config for app %s during recovery: %w", appConfig.AppName, err)
+		}
+
+		// Attempt device-side copy
+		if err := d.copyRPC(ctx, src, dest); err != nil {
+			log.G(ctx).Warnf("Image recovery copy failed for app %s (src=%s dest=%s): %v", appConfig.AppName, src, dest, err)
+			return fmt.Errorf("app %s did not reach RUNNING state after install: %w", appConfig.AppName, waitErr)
+		}
+
+		log.G(ctx).Infof("Image recovery copy succeeded for app %s (dest=%s), retrying install", appConfig.AppName, dest)
+
+		// Retry install using the on-device destination file
+		if err := d.InstallApp(ctx, appConfig.AppName, dest); err != nil {
+			return fmt.Errorf("failed to retry install for app %s after recovery: %w", appConfig.AppName, err)
+		}
+
+		// Wait again for RUNNING state
+		log.G(ctx).Infof("Waiting for app %s to reach RUNNING state after recovery (timeout: %v)", appConfig.AppName, timeout)
+		if err := d.WaitForAppStatus(ctx, appConfig.AppName, "RUNNING", timeout); err != nil {
+			return fmt.Errorf("app %s did not reach RUNNING state after recovery install: %w", appConfig.AppName, err)
+		}
+
+		log.G(ctx).Infof("Successfully recovered and installed app %s", appConfig.AppName)
+		return nil
+	}
+
+	// Not an HTTP URL or copy failed - return original wait error
+	return fmt.Errorf("app %s did not reach RUNNING state after install: %w", appConfig.AppName, waitErr)
 }
 
 // appHostingRPC executes an app-hosting RPC operation on the device
@@ -125,70 +208,6 @@ func (d *XEDriver) InstallApp(ctx context.Context, appID string, packagePath str
 
 	log.G(ctx).Infof("Successfully installed app %s", appID)
 	return nil
-}
-
-func (d *XEDriver) installWithRecovery(ctx context.Context, appConfig AppHostingConfig) error {
-	// First attempt: install using the image path as provided (current behavior).
-	err := d.InstallApp(ctx, appConfig.AppName, appConfig.ImagePath)
-	if err == nil {
-		return nil
-	}
-
-	// Recovery path should be driven by imagePullPolicy.
-	// Kubernetes defaulting: if empty, default is PullIfNotPresent.
-	policy := appConfig.ImagePullPolicy
-	if policy == "" {
-		policy = "IfNotPresent"
-	}
-
-	// If user explicitly says never pull, do not attempt recovery.
-	if policy == "Never" {
-		return err
-	}
-
-	log.G(ctx).Warnf("Install failed for app %s, attempting image recovery (policy=%s): %v", appConfig.AppName, policy, err)
-
-	// Attempt a best-effort recovery:
-	// - determine on-device package destination (annotation value propagated into appConfig.PackageDest)
-	// - if ImagePath is HTTP(S), try device-side fetch via IOS-XE copy RPC (optionally applying basic auth)
-	// - retry app-hosting install once using the on-device destination file
-	//
-	// Known gaps:
-	// - non-HTTP sources (e.g., local tar path) are not uploaded yet
-	// - token-based auth is parsed but not applied to the device fetch currently
-	//
-	// Destination defaulting:
-	// if PackageDest is not set, default to flash:/virtual-kubelet/<app>.tar
-	dest := appConfig.PackageDest
-	if dest == "" {
-		dest = fmt.Sprintf("flash:/virtual-kubelet/%s.tar", appConfig.AppName)
-	}
-	log.G(ctx).Infof("Install recovery destination for app %s: %s", appConfig.AppName, dest)
-
-	// If the image path is already something the device can fetch (URL), try a device-side copy to dest.
-	// This matches the desired "device pulls" behavior via IOS-XE copy RPC.
-	copySrc := appConfig.ImagePath
-	if isHTTPURL(copySrc) {
-		src := copySrc
-		if d.secretLister != nil && len(appConfig.ImagePullSecrets) > 0 {
-			if u, err := d.maybeAddAuthToURL(ctx, src, appConfig.ImagePullSecrets); err != nil {
-				log.G(ctx).Warnf("Failed to apply imagePullSecrets auth for app %s: %v", appConfig.AppName, err)
-			} else if u != "" {
-				src = u
-			}
-		}
-
-		if err := d.copyRPC(ctx, src, dest); err != nil {
-			log.G(ctx).Warnf("Image recovery copy failed for app %s (src=%s dest=%s): %v", appConfig.AppName, src, dest, err)
-		} else {
-			log.G(ctx).Infof("Image recovery copy succeeded for app %s (dest=%s)", appConfig.AppName, dest)
-			// Retry install using the on-device destination file.
-			return d.InstallApp(ctx, appConfig.AppName, dest)
-		}
-	}
-
-	// Best-effort retry with original packagePath (current behavior).
-	return d.InstallApp(ctx, appConfig.AppName, appConfig.ImagePath)
 }
 
 const (

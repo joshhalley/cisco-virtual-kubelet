@@ -594,33 +594,86 @@ func TestConvertPodToAppConfigs_PackageDestAnnotation(t *testing.T) {
 		config: &v1alpha1.DeviceSpec{},
 	}
 
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-pod",
-			Namespace: "default",
-			UID:       "12345678-1234-1234-1234-123456789abc",
-			Annotations: map[string]string{
-				podAnnotationIOSXEAppHostPackageDest: "flash:/virtual-kubelet/custom.tar",
-			},
+	tests := []struct {
+		name        string
+		annotation  string
+		expectError bool
+		expected    string
+	}{
+		{
+			name:        "path with slash",
+			annotation:  "flash:/virtual-kubelet/custom.tar",
+			expectError: false,
+			expected:    "flash:/virtual-kubelet/custom.tar",
 		},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{{
-				Name:  "nginx",
-				Image: "nginx:latest",
-			}},
+		{
+			name:        "path without slash",
+			annotation:  "flash:nginx_latest.tar",
+			expectError: false,
+			expected:    "flash:nginx_latest.tar",
+		},
+		{
+			name:        "bootflash without slash",
+			annotation:  "bootflash:app.tar",
+			expectError: false,
+			expected:    "bootflash:app.tar",
+		},
+		{
+			name:        "bootflash with slash",
+			annotation:  "bootflash:/apps/myapp.tar",
+			expectError: false,
+			expected:    "bootflash:/apps/myapp.tar",
+		},
+		{
+			name:        "invalid no filename",
+			annotation:  "flash:",
+			expectError: true,
+		},
+		{
+			name:        "invalid scheme",
+			annotation:  "http://example.com/app.tar",
+			expectError: true,
 		},
 	}
 
-	configs, err := driver.ConvertPodToAppConfigs(pod)
-	if err != nil {
-		t.Fatalf("Expected no error, got: %v", err)
-	}
-	if len(configs) != 1 {
-		t.Fatalf("Expected 1 config, got %d", len(configs))
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					UID:       "12345678-1234-1234-1234-123456789abc",
+					Annotations: map[string]string{
+						podAnnotationIOSXEAppHostPackageDest: tt.annotation,
+					},
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{
+						Name:  "nginx",
+						Image: "nginx:latest",
+					}},
+				},
+			}
 
-	if configs[0].PackageDest != "flash:/virtual-kubelet/custom.tar" {
-		t.Fatalf("Expected PackageDest to be propagated, got %q", configs[0].PackageDest)
+			configs, err := driver.ConvertPodToAppConfigs(pod)
+			if tt.expectError {
+				if err == nil {
+					t.Fatalf("Expected error for annotation %q, got none", tt.annotation)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Expected no error for annotation %q, got: %v", tt.annotation, err)
+			}
+			if len(configs) != 1 {
+				t.Fatalf("Expected 1 config, got %d", len(configs))
+			}
+
+			if configs[0].PackageDest != tt.expected {
+				t.Fatalf("Expected PackageDest to be %q, got %q", tt.expected, configs[0].PackageDest)
+			}
+		})
 	}
 }
 
