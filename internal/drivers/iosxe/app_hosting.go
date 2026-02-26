@@ -15,11 +15,14 @@
 package iosxe
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -122,13 +125,24 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 			return fmt.Errorf("failed to re-post config for app %s during recovery: %w", appConfig.AppName, err)
 		}
 
-		// Attempt device-side copy
-		if err := d.copyRPC(ctx, src, dest); err != nil {
-			log.G(ctx).Warnf("Image recovery copy failed for app %s (src=%s dest=%s): %v", appConfig.AppName, src, dest, err)
-			return fmt.Errorf("app %s did not reach RUNNING state after install: %w", appConfig.AppName, waitErr)
+		// Check if file already exists on device before initiating copy
+		fileExists, err := d.fileExists(ctx, dest)
+		if err != nil {
+			log.G(ctx).Warnf("Failed to check if file exists at %s: %v (will attempt copy anyway)", dest, err)
+			fileExists = false
 		}
 
-		log.G(ctx).Infof("Image recovery copy succeeded for app %s (dest=%s), retrying install", appConfig.AppName, dest)
+		if fileExists {
+			log.G(ctx).Infof("Image file already exists on device at %s, skipping copy", dest)
+		} else {
+			// Attempt device-side copy
+			if err := d.copyRPC(ctx, src, dest); err != nil {
+				log.G(ctx).Warnf("Image recovery copy failed for app %s (src=%s dest=%s): %v", appConfig.AppName, src, dest, err)
+				return fmt.Errorf("app %s did not reach RUNNING state after install: %w", appConfig.AppName, waitErr)
+			}
+
+			log.G(ctx).Infof("Image recovery copy succeeded for app %s (dest=%s), retrying install", appConfig.AppName, dest)
+		}
 
 		// Retry install using the on-device destination file
 		if err := d.InstallApp(ctx, appConfig.AppName, dest); err != nil {
@@ -177,6 +191,9 @@ type iosxeCopyRPCRequest struct {
 }
 
 func (d *XEDriver) copyRPC(ctx context.Context, source string, destination string) error {
+	// Copy operations can take several minutes for large images.
+	// The NetworkClient is configured with a 10-minute timeout (see driver.go) to handle this.
+
 	payload := map[string]iosxeCopyRPCRequest{
 		"Cisco-IOS-XE-rpc:copy": {
 			Source:      source,
@@ -190,11 +207,90 @@ func (d *XEDriver) copyRPC(ctx context.Context, source string, destination strin
 		return json.Marshal(v)
 	}
 
+	log.G(ctx).Infof("Starting copy operation (may take several minutes for large images): %s -> %s", source, destination)
+
 	if err := d.client.Post(ctx, path, payload, jsonMarshaller); err != nil {
 		return fmt.Errorf("copy operation failed (source=%s destination=%s): %w", source, destination, err)
 	}
 
+	log.G(ctx).Infof("Copy operation completed successfully: %s -> %s", source, destination)
 	return nil
+}
+
+// fileExists checks if a file exists on the device using the dir CLI command via exec RPC
+func (d *XEDriver) fileExists(ctx context.Context, filePath string) (bool, error) {
+	// Safety check: if config is not available (e.g., in tests), assume file doesn't exist
+	if d.config == nil {
+		return false, fmt.Errorf("driver config not available")
+	}
+
+	// Use the CLI exec RPC to run "dir <filePath>" command
+	// Format: flash:filename or flash:/path/filename
+	payload := map[string]interface{}{
+		"Cisco-IOS-XE-rpc:exec": map[string]string{
+			"cmd": fmt.Sprintf("dir %s", filePath),
+		},
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal exec payload: %w", err)
+	}
+
+	// Get the base URL and credentials from the driver config
+	port := d.config.Port
+	if port == 0 {
+		if d.config.TLS != nil && d.config.TLS.Enabled {
+			port = 443
+		} else {
+			port = 80
+		}
+	}
+	baseURL := fmt.Sprintf("https://%s:%d", d.config.Address, port)
+	path := "/restconf/operations/Cisco-IOS-XE-rpc:exec"
+	url := baseURL + path
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(data))
+	if err != nil {
+		return false, fmt.Errorf("failed to create exec request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/yang-data+json")
+	req.Header.Set("Accept", "application/yang-data+json")
+	req.SetBasicAuth(d.config.Username, d.config.Password)
+
+	insecureSkipVerify := false
+	if d.config.TLS != nil {
+		insecureSkipVerify = d.config.TLS.InsecureSkipVerify
+	}
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: insecureSkipVerify,
+	}
+
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("exec operation failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// If the file doesn't exist, IOS-XE returns an error status or specific output
+	// If status is 200 and output doesn't contain "No such file", file exists
+	if resp.StatusCode >= 300 {
+		// File doesn't exist or command failed
+		return false, nil
+	}
+
+	// File existence is determined by successful command execution
+	// If dir command succeeds, file exists
+	return true, nil
 }
 
 // InstallApp installs an app package on the device

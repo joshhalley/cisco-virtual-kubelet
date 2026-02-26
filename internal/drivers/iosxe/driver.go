@@ -91,7 +91,8 @@ func NewAppHostingDriver(ctx context.Context, spec *v1alpha1.DeviceSpec) (*XEDri
 	}
 
 	BaseUrl := u.String()
-	Timeout := 30 * time.Second
+	// Increased timeout to 10 minutes to support long-running copy operations for large container images
+	Timeout := 10 * time.Minute
 	Client, err := common.NewNetworkClient(
 		BaseUrl,
 		&common.ClientAuth{

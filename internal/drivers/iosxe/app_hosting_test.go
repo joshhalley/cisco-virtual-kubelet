@@ -190,6 +190,7 @@ func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
 	d := &XEDriver{
 		client:       client,
 		secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}},
+		// Don't set config in test - copyRPC and fileExists will be mocked via fakeNetworkClient
 	}
 
 	cfg := AppHostingConfig{
