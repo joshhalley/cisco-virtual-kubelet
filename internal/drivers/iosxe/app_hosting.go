@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/url"
@@ -105,7 +106,6 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 	if isHTTPURL(copySrc) {
 		// Mark pod as recovering to prevent GetPodStatus from causing pod deletion
 		d.markPodRecovering(appConfig.PodUID)
-		defer d.clearPodRecovering(appConfig.PodUID)
 
 		src := copySrc
 		if d.secretLister != nil && len(appConfig.ImagePullSecrets) > 0 {
@@ -126,6 +126,7 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 		log.G(ctx).Infof("Re-posting config for app %s before recovery", appConfig.AppName)
 		configPath := "/restconf/data/Cisco-IOS-XE-app-hosting-cfg:app-hosting-cfg-data/apps"
 		if err := d.client.Post(ctx, configPath, appConfig.Apps, d.marshaller); err != nil {
+			d.clearPodRecovering(appConfig.PodUID)
 			return fmt.Errorf("failed to re-post config for app %s during recovery: %w", appConfig.AppName, err)
 		}
 
@@ -142,6 +143,7 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 			// Attempt device-side copy
 			if err := d.copyRPC(ctx, src, dest); err != nil {
 				log.G(ctx).Warnf("Image recovery copy failed for app %s (src=%s dest=%s): %v", appConfig.AppName, src, dest, err)
+				d.clearPodRecovering(appConfig.PodUID)
 				return fmt.Errorf("app %s did not reach RUNNING state after install: %w", appConfig.AppName, waitErr)
 			}
 
@@ -150,15 +152,19 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 
 		// Retry install using the on-device destination file
 		if err := d.InstallApp(ctx, appConfig.AppName, dest); err != nil {
+			d.clearPodRecovering(appConfig.PodUID)
 			return fmt.Errorf("failed to retry install for app %s after recovery: %w", appConfig.AppName, err)
 		}
 
 		// Wait again for RUNNING state
 		log.G(ctx).Infof("Waiting for app %s to reach RUNNING state after recovery (timeout: %v)", appConfig.AppName, timeout)
 		if err := d.WaitForAppStatus(ctx, appConfig.AppName, "RUNNING", timeout); err != nil {
+			d.clearPodRecovering(appConfig.PodUID)
 			return fmt.Errorf("app %s did not reach RUNNING state after recovery install: %w", appConfig.AppName, err)
 		}
 
+		// Recovery completed successfully - clear the recovery flag now that app is RUNNING
+		d.clearPodRecovering(appConfig.PodUID)
 		log.G(ctx).Infof("Successfully recovered and installed app %s", appConfig.AppName)
 		return nil
 	}
@@ -293,16 +299,50 @@ func (d *XEDriver) fileExists(ctx context.Context, filePath string) (bool, error
 	}
 	defer resp.Body.Close()
 
-	// If the file doesn't exist, IOS-XE returns an error status or specific output
-	// If status is 200 and output doesn't contain "No such file", file exists
-	if resp.StatusCode >= 300 {
-		// File doesn't exist or command failed
-		log.G(ctx).Infof("File %s does not exist on device (HTTP status: %d)", filePath, resp.StatusCode)
+	// Read the response body to parse the actual command output
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.G(ctx).Warnf("Failed to read exec response body: %v", err)
+		return false, fmt.Errorf("failed to read exec response: %w", err)
+	}
+
+	log.G(ctx).Debugf("Exec RPC response (status=%d): %s", resp.StatusCode, string(body))
+
+	// Parse the JSON response to extract the result field
+	var execResp struct {
+		Result string `json:"Cisco-IOS-XE-rpc:result"`
+	}
+	if err := json.Unmarshal(body, &execResp); err != nil {
+		log.G(ctx).Warnf("Failed to parse exec response JSON: %v", err)
+		// If we can't parse JSON, treat as error (file doesn't exist)
 		return false, nil
 	}
 
-	// File existence is determined by successful command execution
-	// If dir command succeeds, file exists
+	result := execResp.Result
+	log.G(ctx).Debugf("Dir command output: %s", result)
+
+	// Check if the result contains error messages indicating file doesn't exist
+	// Common IOS-XE error patterns:
+	// - "No such file or directory"
+	// - "Error"
+	// - "%Error"
+	// - Empty result
+	if result == "" {
+		log.G(ctx).Infof("File %s does not exist on device (empty dir output)", filePath)
+		return false, nil
+	}
+
+	resultLower := strings.ToLower(result)
+	if strings.Contains(resultLower, "no such file") ||
+		strings.Contains(resultLower, "%error") ||
+		strings.Contains(resultLower, "error opening") ||
+		strings.Contains(resultLower, "invalid") {
+		log.G(ctx).Infof("File %s does not exist on device (dir error: %s)", filePath, result)
+		return false, nil
+	}
+
+	// If we got output that doesn't contain error messages, the file exists
+	// The output should contain file size, date, and filename
 	log.G(ctx).Infof("File %s exists on device (confirmed via dir command)", filePath)
 	return true, nil
 }
