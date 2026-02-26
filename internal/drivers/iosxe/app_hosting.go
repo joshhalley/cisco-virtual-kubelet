@@ -103,6 +103,10 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 	// If the image path is already something the device can fetch (URL), try a device-side copy to dest.
 	copySrc := appConfig.ImagePath
 	if isHTTPURL(copySrc) {
+		// Mark pod as recovering to prevent GetPodStatus from causing pod deletion
+		d.markPodRecovering(appConfig.PodUID)
+		defer d.clearPodRecovering(appConfig.PodUID)
+
 		src := copySrc
 		if d.secretLister != nil && len(appConfig.ImagePullSecrets) > 0 {
 			if u, err := d.maybeAddAuthToURL(ctx, src, appConfig.ImagePullSecrets); err != nil {

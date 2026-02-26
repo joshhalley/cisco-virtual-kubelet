@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/cisco/virtual-kubelet-cisco/api/v1alpha1"
@@ -48,6 +49,10 @@ type XEDriver struct {
 	deviceInfo   *common.DeviceInfo
 
 	secretLister corev1listers.SecretNamespaceLister
+
+	// Recovery tracking to prevent pod deletion during install recovery
+	recoveryMu      sync.RWMutex
+	recoveringPods  map[string]bool // map[podUID]bool
 }
 
 // NewAppHostingDriver creates a new IOS-XE AppHosting driver instance
@@ -105,8 +110,9 @@ func NewAppHostingDriver(ctx context.Context, spec *v1alpha1.DeviceSpec) (*XEDri
 	)
 
 	d := &XEDriver{
-		config: spec,
-		client: Client,
+		config:         spec,
+		client:         Client,
+		recoveringPods: make(map[string]bool),
 	}
 
 	protocol := "restconf"
@@ -278,4 +284,25 @@ func (d *XEDriver) debugLogJson(ctx context.Context, obj ygot.GoStruct) error {
 
 	log.G(ctx).Debug(jsonStr)
 	return nil
+}
+
+// markPodRecovering marks a pod as currently undergoing recovery
+func (d *XEDriver) markPodRecovering(podUID string) {
+	d.recoveryMu.Lock()
+	defer d.recoveryMu.Unlock()
+	d.recoveringPods[podUID] = true
+}
+
+// clearPodRecovering removes the recovery flag for a pod
+func (d *XEDriver) clearPodRecovering(podUID string) {
+	d.recoveryMu.Lock()
+	defer d.recoveryMu.Unlock()
+	delete(d.recoveringPods, podUID)
+}
+
+// isPodRecovering checks if a pod is currently undergoing recovery
+func (d *XEDriver) isPodRecovering(podUID string) bool {
+	d.recoveryMu.RLock()
+	defer d.recoveryMu.RUnlock()
+	return d.recoveringPods[podUID]
 }

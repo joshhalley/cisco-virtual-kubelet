@@ -283,6 +283,28 @@ func (d *XEDriver) DeletePod(ctx context.Context, pod *v1.Pod) error {
 func (d *XEDriver) GetPodStatus(ctx context.Context, pod *v1.Pod) (*v1.Pod, error) {
 	log.G(ctx).Debug("GetPodStatus request received")
 
+	// Check if pod is currently undergoing recovery
+	if d.isPodRecovering(string(pod.UID)) {
+		log.G(ctx).Infof("Pod %s/%s is currently undergoing install recovery, returning intermediate status", pod.Namespace, pod.Name)
+		// Return a copy of the pod with "Pod is recovering" status
+		statusPod := pod.DeepCopy()
+		// Set container statuses to Waiting with reason "Recovering"
+		statusPod.Status.ContainerStatuses = make([]v1.ContainerStatus, len(pod.Spec.Containers))
+		for i, container := range pod.Spec.Containers {
+			statusPod.Status.ContainerStatuses[i] = v1.ContainerStatus{
+				Name:  container.Name,
+				State: v1.ContainerState{
+					Waiting: &v1.ContainerStateWaiting{
+						Reason:  "Recovering",
+						Message: "Container is being recovered after install timeout",
+					},
+				},
+				Ready: false,
+			}
+		}
+		return statusPod, nil
+	}
+
 	// Get containers for this pod
 	discoveredContainers, err := d.GetPodContainers(ctx, pod)
 	if err != nil {

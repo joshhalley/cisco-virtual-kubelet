@@ -64,6 +64,7 @@ type resourceConfig struct {
 type AppHostingConfig struct {
 	AppName          string
 	ContainerName    string
+	PodUID           string // Pod UID for recovery tracking
 	ImagePath        string
 	ImagePullPolicy  v1.PullPolicy
 	PackageDest      string
@@ -246,6 +247,7 @@ func (d *XEDriver) ConvertPodToAppConfigs(pod *v1.Pod) ([]AppHostingConfig, erro
 		configs = append(configs, AppHostingConfig{
 			AppName:          appName,
 			ContainerName:    container.Name,
+			PodUID:           string(pod.UID),
 			ImagePath:        container.Image,
 			ImagePullPolicy:  container.ImagePullPolicy,
 			PackageDest:      packageDest,

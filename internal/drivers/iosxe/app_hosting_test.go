@@ -188,14 +188,16 @@ func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
 	}
 
 	d := &XEDriver{
-		client:       client,
-		secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}},
+		client:         client,
+		secretLister:   &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}},
+		recoveringPods: make(map[string]bool),
 		// Don't set config in test - copyRPC and fileExists will be mocked via fakeNetworkClient
 	}
 
 	cfg := AppHostingConfig{
 		AppName:         "testapp",
 		ContainerName:   "test-container",
+		PodUID:          "test-pod-uid-123",
 		ImagePath:       "http://example.com/app.tar",
 		PackageTimeout:  5 * time.Second,
 		ImagePullPolicy: "Always", // Allow recovery
@@ -240,10 +242,11 @@ func TestCreateAppHostingApp_WaitsForRunning(t *testing.T) {
 		},
 	}
 
-	d := &XEDriver{client: client, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}}
+	d := &XEDriver{client: client, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}, recoveringPods: make(map[string]bool)}
 	cfg := AppHostingConfig{
 		AppName:        "testapp",
 		ContainerName:  "test-container",
+		PodUID:         "test-pod-uid",
 		ImagePath:      "http://example.com/app.tar",
 		PackageTimeout: 30 * time.Second,
 		Apps:           &Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps{},
@@ -274,10 +277,11 @@ func TestCreateAppHostingApp_TimeoutWhenNeverRunning(t *testing.T) {
 		},
 	}
 
-	d := &XEDriver{client: client, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}}
+	d := &XEDriver{client: client, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}, recoveringPods: make(map[string]bool)}
 	cfg := AppHostingConfig{
 		AppName:        "testapp",
 		ContainerName:  "test-container",
+		PodUID:         "test-pod-uid",
 		ImagePath:      "http://example.com/app.tar",
 		PackageTimeout: 5 * time.Second, // short timeout for test speed
 		Apps:           &Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps{},
@@ -310,10 +314,11 @@ func TestCreateAppHostingApp_TimeoutWhenStuckAtActivated(t *testing.T) {
 		},
 	}
 
-	d := &XEDriver{client: client, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}}
+	d := &XEDriver{client: client, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}, recoveringPods: make(map[string]bool)}
 	cfg := AppHostingConfig{
 		AppName:        "testapp",
 		ContainerName:  "test-container",
+		PodUID:         "test-pod-uid",
 		ImagePath:      "http://example.com/app.tar",
 		PackageTimeout: 5 * time.Second,
 		Apps:           &Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps{},
@@ -486,7 +491,7 @@ func TestUpdatePod_NoActionWhenRunning(t *testing.T) {
 		},
 	}
 
-	d := &XEDriver{client: client, config: &v1alpha1.DeviceSpec{}, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}}
+	d := &XEDriver{client: client, config: &v1alpha1.DeviceSpec{}, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}, recoveringPods: make(map[string]bool)}
 
 	err := d.UpdatePod(context.Background(), pod)
 	if err != nil {
@@ -574,7 +579,7 @@ func TestUpdatePod_RedeploysWhenNoOperData(t *testing.T) {
 		},
 	}
 
-	d := &XEDriver{client: client, config: &v1alpha1.DeviceSpec{}, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}}
+	d := &XEDriver{client: client, config: &v1alpha1.DeviceSpec{}, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}, recoveringPods: make(map[string]bool)}
 
 	err := d.UpdatePod(context.Background(), pod)
 	if err != nil {
@@ -657,7 +662,7 @@ func TestUpdatePod_RedeploysWhenStuckState(t *testing.T) {
 		},
 	}
 
-	d := &XEDriver{client: client, config: &v1alpha1.DeviceSpec{}, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}}
+	d := &XEDriver{client: client, config: &v1alpha1.DeviceSpec{}, secretLister: &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}}, recoveringPods: make(map[string]bool)}
 
 	err := d.UpdatePod(context.Background(), pod)
 	if err != nil {
