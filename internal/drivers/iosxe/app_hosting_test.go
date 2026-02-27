@@ -156,12 +156,54 @@ func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
 	getCalls := 0
 	postCalls := []string{}
 	copyCalled := false
+	lastRPC := "" // Track the last RPC operation called
+	installedAfterCopy := false // Track if we've done install after copy
+	initialInstallDone := false // Track if first install was attempted
 
 	client := &fakeNetworkClient{
 		postHook: func(path string, payload any) error {
 			postCalls = append(postCalls, path)
+			t.Logf("POST: path=%s, copyCalled=%v, initialInstallDone=%v", path, copyCalled, initialInstallDone)
+
 			if path == "/restconf/operations/Cisco-IOS-XE-rpc:copy" {
 				copyCalled = true
+				t.Logf("  -> Copy RPC called, copyCalled=true")
+				return nil
+			}
+
+			// Check if this is an app-hosting RPC by inspecting the payload
+			if path == "/restconf/operations/Cisco-IOS-XE-rpc:app-hosting" {
+				// Payload is a map[string]interface{} with operation name as key
+				if payloadMap, ok := payload.(map[string]interface{}); ok {
+					if _, hasInstall := payloadMap["install"]; hasInstall {
+						if !initialInstallDone {
+							initialInstallDone = true
+							lastRPC = "install-failed" // Mark as failed install
+							t.Logf("  -> First install RPC, marked as failed")
+						} else {
+							lastRPC = "install"
+							if copyCalled {
+								installedAfterCopy = true
+								t.Logf("  -> Recovery install after copy, installedAfterCopy=true")
+							}
+						}
+					} else if _, hasActivate := payloadMap["activate"]; hasActivate {
+						lastRPC = "activate"
+						t.Logf("  -> Activate RPC")
+					} else if _, hasStart := payloadMap["start"]; hasStart {
+						lastRPC = "start"
+						t.Logf("  -> Start RPC")
+					} else if _, hasStop := payloadMap["stop"]; hasStop {
+						lastRPC = "stop"
+						t.Logf("  -> Stop RPC")
+					} else if _, hasDeactivate := payloadMap["deactivate"]; hasDeactivate {
+						lastRPC = "deactivate"
+						t.Logf("  -> Deactivate RPC")
+					} else if _, hasUninstall := payloadMap["uninstall"]; hasUninstall {
+						lastRPC = "uninstall"
+						t.Logf("  -> Uninstall RPC")
+					}
+				}
 			}
 			return nil
 		},
@@ -171,18 +213,76 @@ func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
 			if !ok {
 				return nil
 			}
-			// Before recovery: no oper data (timeout scenario)
-			// After recovery (copy called): return RUNNING
-			if copyCalled {
-				oper := makeOperData("testapp", "RUNNING")
-				*root = *oper
-			} else {
-				root.App = nil // no oper data = image not pulled
+
+			// Debug: log the current state
+			t.Logf("GET call #%d: copyCalled=%v, installedAfterCopy=%v, initialInstallDone=%v, lastRPC=%s", getCalls, copyCalled, installedAfterCopy, initialInstallDone, lastRPC)
+
+			// Phase 1: Initial install attempt (before recovery)
+			// During initial install wait, return no oper data to simulate image pull failure
+			if initialInstallDone && !copyCalled {
+				root.App = nil
+				t.Logf("  -> Returning: no oper data (initial install - waiting for image that never arrives)")
+				return nil
 			}
+
+			// Phase 2: During cleanup (DeleteApp after initial install timeout)
+			if copyCalled && !installedAfterCopy {
+				// During DeleteApp sequence
+				switch lastRPC {
+				case "stop":
+					// After stop, should be ACTIVATED
+					oper := makeOperData("testapp", "ACTIVATED")
+					*root = *oper
+					t.Logf("  -> Returning: ACTIVATED (after stop during cleanup)")
+					return nil
+				case "deactivate":
+					// After deactivate, should be DEPLOYED
+					oper := makeOperData("testapp", "DEPLOYED")
+					*root = *oper
+					t.Logf("  -> Returning: DEPLOYED (after deactivate during cleanup)")
+					return nil
+				case "uninstall", "config-deleted":
+					// After uninstall, no oper data
+					root.App = nil
+					t.Logf("  -> Returning: no oper data (after uninstall/delete)")
+					return nil
+				default:
+					// Default during cleanup: app exists in RUNNING state (before stop)
+					oper := makeOperData("testapp", "RUNNING")
+					*root = *oper
+					t.Logf("  -> Returning: RUNNING (default during cleanup)")
+					return nil
+				}
+			}
+
+			// Phase 3: After recovery install
+			if installedAfterCopy {
+				// Simulate state progression based on last RPC
+				var state string
+				switch lastRPC {
+				case "install":
+					state = "DEPLOYED"
+				case "activate":
+					state = "ACTIVATED"
+				case "start":
+					state = "RUNNING"
+				default:
+					state = "DEPLOYED"
+				}
+				t.Logf("  -> Returning: state=%s (after recovery)", state)
+				oper := makeOperData("testapp", state)
+				*root = *oper
+				return nil
+			}
+
+			// Default: no oper data (before any install)
+			root.App = nil
+			t.Logf("  -> Returning: no oper data (default - before any install)")
 			return nil
 		},
 		deleteHook: func(path string) error {
 			// Track that cleanup happened
+			lastRPC = "config-deleted"
 			return nil
 		},
 	}
@@ -191,7 +291,7 @@ func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
 		client:         client,
 		secretLister:   &fakeSecretNamespaceLister{secrets: map[string]*v1.Secret{}},
 		recoveringPods: make(map[string]bool),
-		// Don't set config in test - copyRPC and fileExists will be mocked via fakeNetworkClient
+		// Don't set config in test - copyRPC will be mocked via fakeNetworkClient
 	}
 
 	cfg := AppHostingConfig{
