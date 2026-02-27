@@ -119,6 +119,13 @@ func (c *RestconfClient) doRequest(ctx context.Context, method, path string, pay
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		if len(data) > 0 {
+			log.G(ctx).WithFields(log.Fields{
+				"status": resp.Status,
+				"body":   string(data),
+			}).Warn("RESTCONF request failed")
+		}
 		return fmt.Errorf("request failed with status %s", resp.Status)
 	}
 

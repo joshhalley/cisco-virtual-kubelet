@@ -171,6 +171,20 @@ func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
 				return nil
 			}
 
+			// If this is a config update, simulate that the config includes an app entry.
+			if path == "/restconf/data/Cisco-IOS-XE-app-hosting-cfg:app-hosting-cfg-data/apps" {
+				lastRPC = "config-updated"
+				if apps, ok := payload.(*Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps); ok {
+					if apps.App == nil {
+						apps.App = make(map[string]*Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps_App)
+					}
+					if _, exists := apps.App["testapp"]; !exists {
+						name := "testapp"
+						apps.App[name] = &Cisco_IOS_XEAppHostingCfg_AppHostingCfgData_Apps_App{ApplicationName: &name}
+					}
+				}
+			}
+
 			// Check if this is an app-hosting RPC by inspecting the payload
 			if path == "/restconf/operations/Cisco-IOS-XE-rpc:app-hosting" {
 				// Payload is a map[string]interface{} with operation name as key
@@ -257,7 +271,7 @@ func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
 
 			// Phase 3: After recovery install
 			if installedAfterCopy {
-				// Simulate state progression based on last RPC
+				// Simulate state progression based on last RPC / config update after recovery.
 				var state string
 				switch lastRPC {
 				case "install":
@@ -265,6 +279,9 @@ func TestCreateAppHostingApp_CopyRecoveryAfterTimeout(t *testing.T) {
 				case "activate":
 					state = "ACTIVATED"
 				case "start":
+					state = "RUNNING"
+				case "config-updated":
+					// Enabling auto-start should trigger device-side activation/run.
 					state = "RUNNING"
 				default:
 					state = "DEPLOYED"

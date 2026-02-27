@@ -174,7 +174,9 @@ func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHosting
 		app.Start = ygot.Bool(true)
 
 		configPath = "/restconf/data/Cisco-IOS-XE-app-hosting-cfg:app-hosting-cfg-data/apps"
-		if err := d.client.Patch(ctx, configPath, appConfig.Apps, d.marshaller); err != nil {
+		// IOS-XE RESTCONF PATCH for app-hosting config isn't consistently supported across versions.
+		// Use POST to the apps container to update the app entry (same approach used earlier in recovery).
+		if err := d.client.Post(ctx, configPath, appConfig.Apps, d.marshaller); err != nil {
 			d.clearPodRecovering(appConfig.PodUID)
 			return fmt.Errorf("failed to update config for app %s to enable auto-start: %w", appConfig.AppName, err)
 		}
