@@ -211,10 +211,15 @@ func (d *XEDriver) GetPodStatus(ctx context.Context, pod *v1.Pod) (*v1.Pod, erro
 		return nil, fmt.Errorf("no containers found for pod %s/%s", pod.Namespace, pod.Name)
 	}
 
-	// Fetch operational data for all apps
+	// Fetch operational data for all apps.
+	// A failure here (e.g. device returns 404 while an app is still installing)
+	// is transient — treat it the same way ListPods does: continue with an empty
+	// map so the pod remains Pending rather than being erroneously deleted by the
+	// VK library interpreting a hard error as "pod not found".
 	allAppOperData, err := d.GetAppOperationalData(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch app operational data: %w", err)
+		log.G(ctx).Warnf("Failed to fetch app operational data for pod %s/%s, will retry: %v", pod.Namespace, pod.Name, err)
+		allAppOperData = make(map[string]*Cisco_IOS_XEAppHostingOper_AppHostingOperData_App)
 	}
 
 	// Filter operational data to only the apps for this pod
