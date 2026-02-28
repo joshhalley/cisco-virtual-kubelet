@@ -43,20 +43,21 @@ func (d *XEDriver) DeployPod(ctx context.Context, pod *v1.Pod) error {
 	// Deploy each app configuration sequentially, waiting for each to reach
 	// DEPLOYED before starting the next.  IOS-XE cannot reliably handle
 	// concurrent install operations and may silently fail.
-	for _, appConfig := range appConfigs {
-		log.G(ctx).Infof("Deploying app: %s for container: %s", appConfig.AppName, appConfig.ContainerName)
+	for i := range appConfigs {
+		appConfig := &appConfigs[i]
+		log.G(ctx).Infof("Deploying app: %s for container: %s", appConfig.AppName(), appConfig.ContainerName())
 
 		err = d.CreateAppHostingApp(ctx, appConfig)
 		if err != nil {
-			return fmt.Errorf("failed to deploy app for container %s: %w", appConfig.ContainerName, err)
+			return fmt.Errorf("failed to deploy app for container %s: %w", appConfig.ContainerName(), err)
 		}
 
 		// Wait for the device to finish installing before submitting the next app.
-		if err := d.WaitForAppStatus(ctx, appConfig.AppName, "DEPLOYED", 120*time.Second); err != nil {
-			log.G(ctx).Warnf("App %s did not reach DEPLOYED within timeout: %v (will continue)", appConfig.AppName, err)
+		if err := d.WaitForAppStatus(ctx, appConfig.AppName(), "DEPLOYED", 120*time.Second); err != nil {
+			log.G(ctx).Warnf("App %s did not reach DEPLOYED within timeout: %v (will continue)", appConfig.AppName(), err)
 		}
 
-		log.G(ctx).Infof("Successfully deployed app %s for container %s", appConfig.AppName, appConfig.ContainerName)
+		log.G(ctx).Infof("Successfully deployed app %s for container %s", appConfig.AppName(), appConfig.ContainerName())
 	}
 
 	log.G(ctx).Infof("Successfully deployed all apps for pod: %s/%s", pod.Namespace, pod.Name)
@@ -240,13 +241,36 @@ func (d *XEDriver) GetPodStatus(ctx context.Context, pod *v1.Pod) (*v1.Pod, erro
 		}
 	}
 
-	// ── Lifecycle remediation ───────────────────────────────────────────
-	// If any app is not yet RUNNING, attempt to advance it through the
-	// install → activate → start lifecycle.  This recovers from silent
-	// failures where the device dropped an operation.
-	for containerName, appID := range discoveredContainers {
-		imagePath := containerImagePath(pod, containerName)
-		d.ensureAppRunning(ctx, appID, appOperDataMap[appID], imagePath)
+	// ── Lifecycle reconciliation ────────────────────────────────────────
+	// For each container, build an AppHostingConfig with DesiredState=Running
+	// and run a single reconcile pass. This replaces the old ensureAppRunning
+	// and can also advance apps stuck in DEPLOYED or ACTIVATED.
+	//
+	// Skip forward reconciliation when the pod is being deleted
+	// (DeletionTimestamp is set). DeletePod is already driving the teardown
+	// via its own reconcile loop; interfering here would race against it
+	// and potentially re-install an app that was just uninstalled.
+	if pod.DeletionTimestamp == nil {
+		for containerName, appID := range discoveredContainers {
+			imagePath := containerImagePath(pod, containerName)
+			appCfg := &AppHostingConfig{
+				Metadata: AppHostingMetadata{
+					AppName:       appID,
+					ContainerName: containerName,
+					PodName:       pod.Name,
+					PodNamespace:  pod.Namespace,
+					PodUID:        string(pod.UID),
+				},
+				Spec: AppHostingSpec{
+					ImagePath:    imagePath,
+					DesiredState: AppDesiredStateRunning,
+				},
+				Status: AppHostingStatus{Phase: AppPhaseConverging},
+			}
+			d.ReconcileApp(ctx, appCfg)
+		}
+	} else {
+		log.G(ctx).Debugf("Pod %s/%s has DeletionTimestamp set; skipping forward reconciliation", pod.Namespace, pod.Name)
 	}
 
 	// Create a copy of the pod and update its status

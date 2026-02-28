@@ -27,26 +27,26 @@ import (
 
 // CreateAppHostingApp creates a single IOS-XE AppHosting app from an AppHostingConfig.
 // This function configures the app on the device and initiates the installation process.
-func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig AppHostingConfig) error {
-	log.G(ctx).Infof("Creating AppHosting app: %s for container: %s", appConfig.AppName, appConfig.ContainerName)
+func (d *XEDriver) CreateAppHostingApp(ctx context.Context, appConfig *AppHostingConfig) error {
+	log.G(ctx).Infof("Creating AppHosting app: %s for container: %s", appConfig.AppName(), appConfig.ContainerName())
 
 	path := "/restconf/data/Cisco-IOS-XE-app-hosting-cfg:app-hosting-cfg-data/apps"
 
 	// Post the app configuration to the device
-	err := d.client.Post(ctx, path, appConfig.Apps, d.marshaller)
+	err := d.client.Post(ctx, path, appConfig.Spec.DeviceConfig, d.marshaller)
 	if err != nil {
-		return fmt.Errorf("AppHosting config failed for app %s: %w", appConfig.AppName, err)
+		return fmt.Errorf("AppHosting config failed for app %s: %w", appConfig.AppName(), err)
 	}
 
-	log.G(ctx).Infof("AppHosting app %s successfully configured", appConfig.AppName)
+	log.G(ctx).Infof("AppHosting app %s successfully configured", appConfig.AppName())
 
 	// Install the app package
-	err = d.InstallApp(ctx, appConfig.AppName, appConfig.ImagePath)
+	err = d.InstallApp(ctx, appConfig.AppName(), appConfig.ImagePath())
 	if err != nil {
-		return fmt.Errorf("failed to install app %s: %w", appConfig.AppName, err)
+		return fmt.Errorf("failed to install app %s: %w", appConfig.AppName(), err)
 	}
 
-	log.G(ctx).Infof("Successfully created and installed app %s", appConfig.AppName)
+	log.G(ctx).Infof("Successfully created and installed app %s", appConfig.AppName())
 	return nil
 }
 
@@ -150,29 +150,136 @@ func (d *XEDriver) UninstallApp(ctx context.Context, appID string) error {
 	return nil
 }
 
-// ensureAppRunning checks whether an app has operational data after install.
-// The device is expected to auto-advance the app to RUNNING via the config-level
-// `start: true` flag, so this function only handles the silent install failure
-// case where no operational data is present at all.
-// This is a best-effort remediation: errors are logged but not propagated,
-// because the next status poll will retry.
-func (d *XEDriver) ensureAppRunning(ctx context.Context, appID string,
-	operData *Cisco_IOS_XEAppHostingOper_AppHostingOperData_App, imagePath string) {
+// ReconcileApp performs a single reconciliation step, driving the app one state
+// closer to its desired state and updating appConfig.Status in place.
+//
+// Forward (DesiredState = Running):
+//
+//	"" (no config)  → POST config + install RPC  → Converging
+//	"" (config, no oper) → re-issue install RPC   → Converging
+//	"DEPLOYED"      → activate RPC               → Converging
+//	"ACTIVATED"     → start RPC                  → Converging
+//	"RUNNING"       → no-op                      → Ready
+//
+// Reverse (DesiredState = Deleted):
+//
+//	"RUNNING"       → stop RPC                   → Deleting
+//	"ACTIVATED"/"STOPPED" → deactivate RPC       → Deleting
+//	"DEPLOYED"      → uninstall RPC              → Deleting
+//	"" (no oper)    → delete config              → Deleted
+func (d *XEDriver) ReconcileApp(ctx context.Context, appConfig *AppHostingConfig) {
+	appID := appConfig.AppName()
+	desired := appConfig.Spec.DesiredState
 
-	// If there is any operational data, the device has accepted the install and
-	// is driving the lifecycle via start:true — don't interfere.
-	if operData != nil && operData.Details != nil && operData.Details.State != nil {
-		return
+	// 1. Observe current device state.
+	state := d.getAppState(ctx, appID)
+	appConfig.Status.ObservedState = state
+	appConfig.Status.LastTransition = time.Now()
+
+	log.G(ctx).Infof("ReconcileApp %s: observed=%q desired=%s phase=%s",
+		appID, state, desired, appConfig.Status.Phase)
+
+	// ── Forward path: drive toward RUNNING ────────────────────────────
+	if desired == AppDesiredStateRunning {
+		switch state {
+		case "RUNNING":
+			appConfig.Status.Phase = AppPhaseReady
+			appConfig.Status.Message = "App is running"
+			return
+
+		case "ACTIVATED":
+			// ACTIVATED → start
+			appConfig.Status.Phase = AppPhaseConverging
+			appConfig.Status.Message = "Starting app"
+			if err := d.StartApp(ctx, appID); err != nil {
+				log.G(ctx).Warnf("ReconcileApp %s: start failed: %v", appID, err)
+				appConfig.Status.Phase = AppPhaseError
+				appConfig.Status.Message = fmt.Sprintf("start failed: %v", err)
+			}
+			return
+
+		case "DEPLOYED":
+			// DEPLOYED → activate
+			appConfig.Status.Phase = AppPhaseConverging
+			appConfig.Status.Message = "Activating app"
+			if err := d.ActivateApp(ctx, appID); err != nil {
+				log.G(ctx).Warnf("ReconcileApp %s: activate failed: %v", appID, err)
+				appConfig.Status.Phase = AppPhaseError
+				appConfig.Status.Message = fmt.Sprintf("activate failed: %v", err)
+			}
+			return
+
+		default:
+			// No oper data (or unexpected state) — the install likely hasn't
+			// happened or failed silently. Re-issue install if we have an image.
+			imagePath := appConfig.ImagePath()
+			if imagePath == "" {
+				log.G(ctx).Warnf("ReconcileApp %s: no oper data and no image path; cannot install", appID)
+				appConfig.Status.Phase = AppPhaseError
+				appConfig.Status.Message = "no image path available for install"
+				return
+			}
+			appConfig.Status.Phase = AppPhaseConverging
+			appConfig.Status.Message = "Re-issuing install"
+			log.G(ctx).Warnf("ReconcileApp %s: no oper data; re-issuing install (image: %s)", appID, imagePath)
+			if err := d.InstallApp(ctx, appID, imagePath); err != nil {
+				log.G(ctx).Warnf("ReconcileApp %s: install failed: %v", appID, err)
+				appConfig.Status.Phase = AppPhaseError
+				appConfig.Status.Message = fmt.Sprintf("install failed: %v", err)
+			}
+			return
+		}
 	}
 
-	// No operational data at all — the install likely failed silently.
-	if imagePath == "" {
-		log.G(ctx).Warnf("App %s has no oper data and no image path; cannot re-install", appID)
-		return
-	}
-	log.G(ctx).Warnf("App %s has no oper data; re-issuing install (image: %s)", appID, imagePath)
-	if err := d.InstallApp(ctx, appID, imagePath); err != nil {
-		log.G(ctx).Warnf("Re-install of app %s failed: %v", appID, err)
+	// ── Reverse path: drive toward deletion ───────────────────────────
+	if desired == AppDesiredStateDeleted {
+		switch state {
+		case "RUNNING":
+			appConfig.Status.Phase = AppPhaseDeleting
+			appConfig.Status.Message = "Stopping app"
+			if err := d.StopApp(ctx, appID); err != nil {
+				log.G(ctx).Warnf("ReconcileApp %s: stop failed: %v", appID, err)
+				appConfig.Status.Phase = AppPhaseError
+				appConfig.Status.Message = fmt.Sprintf("stop failed: %v", err)
+			}
+			return
+
+		case "ACTIVATED", "STOPPED":
+			appConfig.Status.Phase = AppPhaseDeleting
+			appConfig.Status.Message = "Deactivating app"
+			if err := d.DeactivateApp(ctx, appID); err != nil {
+				log.G(ctx).Warnf("ReconcileApp %s: deactivate failed: %v", appID, err)
+				appConfig.Status.Phase = AppPhaseError
+				appConfig.Status.Message = fmt.Sprintf("deactivate failed: %v", err)
+			}
+			return
+
+		case "DEPLOYED":
+			appConfig.Status.Phase = AppPhaseDeleting
+			appConfig.Status.Message = "Uninstalling app"
+			if err := d.UninstallApp(ctx, appID); err != nil {
+				log.G(ctx).Warnf("ReconcileApp %s: uninstall failed: %v", appID, err)
+				appConfig.Status.Phase = AppPhaseError
+				appConfig.Status.Message = fmt.Sprintf("uninstall failed: %v", err)
+			}
+			return
+
+		default:
+			// No operational data — safe to remove config.
+			appConfig.Status.Phase = AppPhaseDeleting
+			appConfig.Status.Message = "Removing config"
+			path := fmt.Sprintf("/restconf/data/Cisco-IOS-XE-app-hosting-cfg:app-hosting-cfg-data/apps/app=%s", appID)
+			if err := d.client.Delete(ctx, path); err != nil {
+				log.G(ctx).Warnf("ReconcileApp %s: config delete failed: %v", appID, err)
+				appConfig.Status.Phase = AppPhaseError
+				appConfig.Status.Message = fmt.Sprintf("config delete failed: %v", err)
+				return
+			}
+			appConfig.Status.Phase = AppPhaseDeleted
+			appConfig.Status.Message = "App fully removed"
+			log.G(ctx).Infof("ReconcileApp %s: fully deleted", appID)
+			return
+		}
 	}
 }
 
@@ -189,6 +296,9 @@ func containerImagePath(pod *v1.Pod, containerName string) string {
 // getAppState returns the current operational state string for appID, or ""
 // if the app has no oper data or the state cannot be determined.
 func (d *XEDriver) getAppState(ctx context.Context, appID string) string {
+	if d.client == nil {
+		return ""
+	}
 	allOper, err := d.GetAppOperationalData(ctx)
 	if err != nil {
 		log.G(ctx).Warnf("Could not fetch oper data to check state of app %s: %v", appID, err)
@@ -201,91 +311,43 @@ func (d *XEDriver) getAppState(ctx context.Context, appID string) string {
 	return *operData.Details.State
 }
 
-// DeleteApp orchestrates a best-effort teardown of the app lifecycle before
-// removing the config entry.
+// DeleteApp orchestrates a reconciler-driven teardown of the app lifecycle.
 //
-// State is re-read before each RPC so we only issue operations that are valid
-// for the device's *actual* current state.  Each step waits for the expected
-// intermediate state before proceeding to the next, ensuring we never send an
-// RPC the device will reject (e.g. deactivate while still RUNNING).
+// It creates a transient AppHostingConfig with DesiredState=Deleted and
+// repeatedly invokes ReconcileApp until the app reaches the Deleted phase
+// or a timeout is exceeded.
 //
-// The config entry is NOT deleted until the app is confirmed absent from oper
-// data, preventing orphaned apps (still running, no config, unmanageable).
-//
-//	RUNNING  → stop → ACTIVATED → deactivate → DEPLOYED → uninstall → (absent)
-//	ACTIVATED/STOPPED            → deactivate → DEPLOYED → uninstall → (absent)
-//	DEPLOYED                                             → uninstall → (absent)
-//	"" / Uninstalled             → skip teardown, proceed to config delete
+//	RUNNING  → stop → ACTIVATED → deactivate → DEPLOYED → uninstall → (absent) → config delete
 func (d *XEDriver) DeleteApp(ctx context.Context, appID string) error {
-	state := d.getAppState(ctx, appID)
-	log.G(ctx).Infof("Deleting app %s (current state: %q)", appID, state)
-
-	// Step 1: RUNNING → stop → wait for ACTIVATED.
-	if state == "RUNNING" {
-		log.G(ctx).Infof("Stopping app %s", appID)
-		if err := d.StopApp(ctx, appID); err != nil {
-			log.G(ctx).Warnf("Stop app %s failed: %v", appID, err)
-		} else if err := d.WaitForAppStatus(ctx, appID, "ACTIVATED", 30*time.Second); err != nil {
-			log.G(ctx).Warnf("App %s did not reach ACTIVATED after stop: %v", appID, err)
-		}
-		// Re-read; only continue to deactivate if we actually reached ACTIVATED.
-		state = d.getAppState(ctx, appID)
-		log.G(ctx).Debugf("App %s state after stop: %q", appID, state)
+	appConfig := &AppHostingConfig{
+		Metadata: AppHostingMetadata{AppName: appID},
+		Spec:     AppHostingSpec{DesiredState: AppDesiredStateDeleted},
+		Status:   AppHostingStatus{Phase: AppPhaseDeleting},
 	}
 
-	// Step 2: ACTIVATED or STOPPED → deactivate → wait for DEPLOYED.
-	if state == "ACTIVATED" || state == "STOPPED" {
-		log.G(ctx).Infof("Deactivating app %s", appID)
-		if err := d.DeactivateApp(ctx, appID); err != nil {
-			log.G(ctx).Warnf("Deactivate app %s failed: %v", appID, err)
-		} else if err := d.WaitForAppStatus(ctx, appID, "DEPLOYED", 30*time.Second); err != nil {
-			log.G(ctx).Warnf("App %s did not reach DEPLOYED after deactivate: %v", appID, err)
-		}
-		// Re-read; only continue to uninstall if we actually reached DEPLOYED.
-		state = d.getAppState(ctx, appID)
-		log.G(ctx).Debugf("App %s state after deactivate: %q", appID, state)
-	}
+	const maxAttempts = 15
+	const reconcileInterval = 4 * time.Second
 
-	// Step 3: DEPLOYED → uninstall → wait for absent from oper data.
-	// Gate the config delete on oper data being cleared to prevent orphaning.
-	// The device can take a long time, or the RPC may silently fail, so we
-	// retry the uninstall RPC up to maxUninstallAttempts times, waiting
-	// between each attempt.  Only if the app is still present after all
-	// attempts do we return an error.
-	if state == "DEPLOYED" {
-		const maxUninstallAttempts = 3
-		const uninstallWait = 60 * time.Second
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		d.ReconcileApp(ctx, appConfig)
 
-		var uninstallErr error
-		for attempt := 1; attempt <= maxUninstallAttempts; attempt++ {
-			log.G(ctx).Infof("Uninstalling app %s (attempt %d/%d)", appID, attempt, maxUninstallAttempts)
-			if err := d.UninstallApp(ctx, appID); err != nil {
-				log.G(ctx).Warnf("Uninstall app %s attempt %d failed: %v", appID, attempt, err)
-			}
-			if err := d.WaitForAppNotPresent(ctx, appID, uninstallWait); err != nil {
-				log.G(ctx).Warnf("App %s still present after uninstall attempt %d: %v", appID, attempt, err)
-				uninstallErr = err
-				continue
-			}
-			// App is gone — proceed to config delete.
-			uninstallErr = nil
-			break
+		if appConfig.Status.Phase == AppPhaseDeleted {
+			log.G(ctx).Infof("Successfully deleted app %s after %d reconcile pass(es)", appID, attempt)
+			return nil
 		}
-		if uninstallErr != nil {
-			return fmt.Errorf("app %s still present in oper data after %d uninstall attempts; deferring config delete to avoid orphan: %w",
-				appID, maxUninstallAttempts, uninstallErr)
+
+		log.G(ctx).Debugf("DeleteApp %s: attempt %d/%d, phase=%s observed=%q msg=%s",
+			appID, attempt, maxAttempts, appConfig.Status.Phase, appConfig.Status.ObservedState, appConfig.Status.Message)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled while deleting app %s", appID)
+		case <-time.After(reconcileInterval):
 		}
 	}
 
-	// Config delete — only reached once oper data is clean (or was never present).
-	log.G(ctx).Infof("Removing app %s config", appID)
-	path := fmt.Sprintf("/restconf/data/Cisco-IOS-XE-app-hosting-cfg:app-hosting-cfg-data/apps/app=%s", appID)
-	if err := d.client.Delete(ctx, path); err != nil {
-		return fmt.Errorf("failed to delete app config for %s: %w", appID, err)
-	}
-
-	log.G(ctx).Infof("Successfully deleted app %s", appID)
-	return nil
+	return fmt.Errorf("app %s not fully deleted after %d reconcile attempts (last phase: %s, observed: %q)",
+		appID, maxAttempts, appConfig.Status.Phase, appConfig.Status.ObservedState)
 }
 
 // WaitForAppStatus polls the device until the app reaches the expected status or times out
