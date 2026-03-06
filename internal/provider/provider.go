@@ -192,6 +192,8 @@ func (p *AppHostingProvider) RunInContainer(ctx context.Context, namespace strin
 // This follows the NaiveNodeProvider pattern from virtual-kubelet.
 // The library's NodeController handles periodic heartbeat updates automatically.
 type AppHostingNode struct {
+	ctx             context.Context // long-lived app context for async operations
+	nodeName        string
 	deviceSpec      *v1alpha1.DeviceSpec
 	driver          drivers.CiscoKubernetesDeviceDriver
 	statusCallback  func(*v1.Node)
@@ -205,12 +207,17 @@ type AppHostingNode struct {
 	diskPressureTransitionTime metav1.Time
 }
 
-// NewAppHostingNode creates a new AppHostingNode
+// NewAppHostingNode creates a new AppHostingNode.
+// The provided ctx should be the long-lived application context, not a request-scoped one.
 func NewAppHostingNode(
+	ctx context.Context,
+	nodeName string,
 	deviceSpec *v1alpha1.DeviceSpec,
 	driver drivers.CiscoKubernetesDeviceDriver,
 ) *AppHostingNode {
 	return &AppHostingNode{
+		ctx:        ctx,
+		nodeName:   nodeName,
 		deviceSpec: deviceSpec,
 		driver:     driver,
 	}
@@ -229,7 +236,7 @@ func (a *AppHostingNode) Ping(ctx context.Context) error {
 	if !a.syncInFlight && time.Since(a.lastStatusSync) > 30*time.Second {
 		if a.statusCallback != nil {
 			a.syncInFlight = true
-			go a.syncNodeStatus(ctx, a.statusCallback)
+			go a.syncNodeStatus(a.ctx, a.statusCallback)
 			a.lastStatusSync = time.Now()
 		}
 	}
@@ -248,8 +255,9 @@ func (a *AppHostingNode) NotifyNodeStatus(ctx context.Context, cb func(*v1.Node)
 	a.statusCallback = cb
 	a.statusSyncMutex.Unlock()
 
-	// Perform initial sync immediately
-	go a.syncNodeStatus(ctx, cb)
+	// Perform initial sync immediately using the long-lived app context,
+	// not the NotifyNodeStatus ctx which may be short-lived.
+	go a.syncNodeStatus(a.ctx, cb)
 }
 
 // ForceStatusUpdate triggers an immediate status update if a callback is registered.
@@ -261,11 +269,11 @@ func (a *AppHostingNode) ForceStatusUpdate(ctx context.Context) {
 	a.statusSyncMutex.Unlock()
 
 	if cb != nil && !inFlight {
-		log.G(ctx).Info("Forcing node status update due to pod lifecycle event")
+		log.G(a.ctx).Info("Forcing node status update due to pod lifecycle event")
 		a.statusSyncMutex.Lock()
 		a.syncInFlight = true
 		a.statusSyncMutex.Unlock()
-		go a.syncNodeStatus(ctx, cb)
+		go a.syncNodeStatus(a.ctx, cb)
 	}
 }
 
@@ -379,6 +387,18 @@ func (a *AppHostingNode) syncNodeStatus(ctx context.Context, cb func(*v1.Node)) 
 			capacity[v1.ResourceStorage] = *resource.NewQuantity(operData.Storage.Quota*1024*1024, resource.BinarySI)
 		}
 	}
+
+	// Discover deployed pods to calculate available pod slots
+	var maxPods int64 = 16
+	var deployedPodCount int64
+	pods, podErr := a.driver.ListPods(ctx)
+	if podErr != nil {
+		log.G(ctx).WithError(podErr).Warn("Failed to list pods during node status sync, using 0 for deployed count")
+	} else {
+		deployedPodCount = int64(len(pods))
+	}
+	capacity[v1.ResourcePods] = *resource.NewQuantity(maxPods, resource.DecimalSI)
+
 	// Allocatable reflects currently available resources
 	allocatable := v1.ResourceList{}
 	if operData != nil {
@@ -392,12 +412,17 @@ func (a *AppHostingNode) syncNodeStatus(ctx context.Context, cb func(*v1.Node)) 
 			allocatable[v1.ResourceStorage] = *resource.NewQuantity(operData.Storage.Available*1024*1024, resource.BinarySI)
 		}
 	}
+	availablePods := maxPods - deployedPodCount
+	if availablePods < 0 {
+		availablePods = 0
+	}
+	allocatable[v1.ResourcePods] = *resource.NewQuantity(availablePods, resource.DecimalSI)
 
 	// Create a node update with device info and addresses
 	nodeUpdate := &v1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				"kubernetes.io/hostname":        deviceInfo.SerialNumber, // Or node name
+				"kubernetes.io/hostname":        a.nodeName,
 				"type":                          "virtual-kubelet",
 				"topology.kubernetes.io/zone":   "cisco-iosxe",
 				"topology.kubernetes.io/region": "cisco-iosxe",

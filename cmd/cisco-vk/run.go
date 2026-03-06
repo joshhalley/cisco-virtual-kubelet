@@ -208,7 +208,7 @@ func runVirtualKubelet(cmd *cobra.Command, args []string) error {
 			return nil, nil, fmt.Errorf("failed to create device driver: %w", err)
 		}
 
-		nodeHandler := provider.NewAppHostingNode(&appCfg.Device, sharedDriver)
+		nodeHandler := provider.NewAppHostingNode(ctx, effectiveNodeName, &appCfg.Device, sharedDriver)
 
 		podHandler, err := provider.NewAppHostingProvider(ctx, &appCfg.Device, vkCfg, sharedDriver, nodeHandler)
 		if err != nil {
