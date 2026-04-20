@@ -1,13 +1,17 @@
 # Pre-merge device validation on Cat8kv (Tier 2).
 #
-# Runs on every PR. Builds the PR's CVK from source on ubuntu12,
-# deploys it into a PR-scoped namespace, applies a CiscoDevice CR for
-# the test Cat8kv, and asserts a hello-app Pod reaches Running. All
-# CVK/docker/helm work happens on ubuntu12 via SSH per the hard-split
-# rule; the runner on svr-xl orchestrates and reports status.
+# Every PR: build the PR's CVK on ubuntu12, upgrade the single shared
+# `cvk` helm release in `cvk-system` to the PR's image, reconcile a
+# CiscoDevice against 192.0.2.60, and assert hello-app Pod reaches
+# Ready. All CVK/docker/helm work stays on ubuntu12 per the hard-split
+# rule; the self-hosted runner on svr-xl orchestrates.
 #
-# Destination: .github/workflows/lab-ci-cat8kv.yaml in the
-# cisco-virtual-kubelet repo (or your fork).
+# Shared-release rationale: the chart creates cluster-scoped
+# ClusterRole `cisco-virtual-kubelet-controller` by a fixed name —
+# two concurrent helm releases cannot both own it. Instead a single
+# `cvk` release lives in `cvk-system` and each PR `helm upgrade
+# --install`s it to its own image tag. Per-PR isolation is at the
+# image-tag + CiscoDevice + Pod level, not the release.
 
 name: Lab CI (Cat8kv)
 
@@ -16,9 +20,8 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Serialize runs per PR — if a new commit lands, cancel the
-# in-flight run and start over.
 concurrency:
+  # Serialize per PR branch — a new commit cancels the in-flight run.
   group: lab-ci-cat8kv-${{ github.ref }}
   cancel-in-progress: true
 
@@ -27,31 +30,28 @@ jobs:
     runs-on: [self-hosted, lab-cvk]
     timeout-minutes: 25
     env:
-      # Identifiers unique to this run: used to name Docker tag, k8s
-      # namespace, and helm release so concurrent PRs stay isolated.
       SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       U12: cisco@192.0.2.39
       SSH_KEY: /home/cisco/.ssh/argo_to_u12
+      NS: cvk-system
+      REL: cvk
 
     steps:
       - name: Checkout PR source
         uses: actions/checkout@v4
         with:
-          # Runner is ephemeral, so we don't risk code leakage between
-          # jobs, but keep fetch-depth shallow for speed.
           fetch-depth: 1
 
       - name: Stage source onto ubuntu12
         run: |
           set -euo pipefail
           TAG="pr-${SHA:0:12}"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          echo "NS=cvk-$TAG"  >> "$GITHUB_ENV"
-          echo "REL=cvk-$TAG" >> "$GITHUB_ENV"
+          CR_NAME="cat8kv-pr-${SHA:0:12}"
+          POD_NAME="lab-ci-${SHA:0:12}"
+          echo "TAG=$TAG"           >> "$GITHUB_ENV"
+          echo "CR_NAME=$CR_NAME"   >> "$GITHUB_ENV"
+          echo "POD_NAME=$POD_NAME" >> "$GITHUB_ENV"
 
-          # Stream the working tree into ubuntu12 via tar-over-ssh.
-          # Avoids scp's recursive directory overhead; respects
-          # .gitignore equivalents by using git ls-files.
           git ls-files -z | tar --null -cf - -T - \
             | ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$U12" \
                 "rm -rf ~/cvk-pr && mkdir ~/cvk-pr && tar -xf - -C ~/cvk-pr"
@@ -67,23 +67,23 @@ jobs:
             rm -f /tmp/cvk-${TAG}.tar
           "
 
-      - name: Helm install CVK (PR-scoped)
+      - name: Helm upgrade --install CVK with PR image
         run: |
           ssh -i "$SSH_KEY" "$U12" "
             set -euo pipefail
             cd ~/cvk-pr
-            helm install ${REL} ./charts/cisco-virtual-kubelet \
+            helm upgrade --install ${REL} ./charts/cisco-virtual-kubelet \
               --namespace ${NS} --create-namespace \
               --set image.repository=cisco-vk \
               --set image.tag=${TAG} \
               --set image.pullPolicy=Never \
               --wait --timeout 3m
+            kubectl -n ${NS} rollout status \
+              deploy/${REL}-cisco-virtual-kubelet-controller --timeout=2m
           "
 
       - name: Clean any stale app-hosting state on Cat8kv
         run: |
-          # Uninstall any apps the device still has from prior runs.
-          # Safe against a clean device (no-ops if no apps present).
           ssh -i "$SSH_KEY" "$U12" "bash -s" <<'REMOTE'
           set -eu
           curl -k -sS -u cisco:cisco \
@@ -100,7 +100,7 @@ jobs:
                   for op in ("stop","deactivate","uninstall"):
                       subprocess.run(
                         ["curl","-k","-sS","-u","cisco:cisco","-X","POST",
-                         f"https://192.0.2.60/restconf/operations/Cisco-IOS-XE-rpc:app-hosting",
+                         "https://192.0.2.60/restconf/operations/Cisco-IOS-XE-rpc:app-hosting",
                          "-H","Content-Type: application/yang-data+json",
                          "-H","Accept: application/yang-data+json",
                          "-d", json.dumps({"Cisco-IOS-XE-rpc:input":{op:{"appid":name}}})],
@@ -112,11 +112,15 @@ jobs:
         run: |
           ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
           set -euo pipefail
+
+          # CiscoDevice lives in the chart's release namespace so the
+          # chart-created VK ServiceAccount is in scope for the pod the
+          # controller spawns per device.
           kubectl apply -n ${NS} -f - <<'YAML'
           apiVersion: cisco.vk/v1alpha1
           kind: CiscoDevice
           metadata:
-            name: cat8kv-test
+            name: ${CR_NAME}
             namespace: ${NS}
           spec:
             driver: XE
@@ -135,22 +139,23 @@ jobs:
                     guestInterface: 0
           YAML
 
-          # Wait for the VK Node to register Ready.
+          # Wait for the VK Node (named after the CiscoDevice) to
+          # register Ready.
           for i in \$(seq 1 30); do
-            kubectl get node cat8kv-test >/dev/null 2>&1 && \
-            [ "\$(kubectl get node cat8kv-test -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ] && break
+            kubectl get node ${CR_NAME} >/dev/null 2>&1 && \
+            [ "\$(kubectl get node ${CR_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ] && break
             sleep 5
           done
-          kubectl get node cat8kv-test
+          kubectl get node ${CR_NAME}
 
           kubectl apply -n default -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata:
-            name: lab-ci-${TAG}
+            name: ${POD_NAME}
             namespace: default
           spec:
-            nodeSelector: { kubernetes.io/hostname: cat8kv-test }
+            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
             tolerations:
             - key: virtual-kubelet.io/provider
               operator: Exists
@@ -163,9 +168,8 @@ jobs:
               image: flash:/hello-app.iosxe.tar
           YAML
 
-          # Bounded wait for Running — real hardware takes time.
-          kubectl -n default wait --for=condition=Ready pod/lab-ci-${TAG} --timeout=10m
-          kubectl -n default get pod lab-ci-${TAG} -o wide
+          kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=10m
+          kubectl -n default get pod ${POD_NAME} -o wide
           REMOTE
 
       - name: Teardown (always runs)
@@ -173,12 +177,11 @@ jobs:
         run: |
           ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE || true
           set -u
-          kubectl -n default delete pod lab-ci-${TAG} --ignore-not-found --wait=false || true
-          kubectl -n ${NS} delete ciscodevice --all --ignore-not-found --wait=false || true
-          # Helm uninstall drops the VK deployment + SA + RBAC.
-          helm uninstall ${REL} --namespace ${NS} --wait || true
-          kubectl delete namespace ${NS} --ignore-not-found --wait=false || true
-          # Drop the PR-tagged image from containerd — don't fill disk.
+          kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false || true
+          kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false || true
+          # Do NOT uninstall the shared cvk release — it stays for the
+          # next PR. Do drop the PR-specific image from containerd so
+          # disk doesn't fill.
           sudo k3s ctr images rm docker.io/library/cisco-vk:${TAG} || true
           rm -rf ~/cvk-pr || true
           REMOTE
@@ -190,10 +193,10 @@ jobs:
           kubectl get nodes -o wide
           kubectl get pods -A
           kubectl get ciscodevices -A
-          kubectl -n ${NS} describe deploy || true
-          kubectl -n ${NS} logs deploy/cvk-cisco-virtual-kubelet-controller --tail=200 || true
+          kubectl -n ${NS} describe deploy ${REL}-cisco-virtual-kubelet-controller || true
+          kubectl -n ${NS} logs deploy/${REL}-cisco-virtual-kubelet-controller --tail=200 || true
+          kubectl -n default describe pod ${POD_NAME} || true
           REMOTE
-          # Surface the file as a run artifact.
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

@@ -1,16 +1,15 @@
 # Pre-merge device validation on physical Cat9k (Tier 3).
 #
-# Triggers:
-#   - GitHub merge queue event (preferred — gates merge into main
-#     without blocking concurrent PR development)
-#   - workflow_dispatch (manual release-candidate runs)
+# Triggers on GitHub merge queue events (gates the actual merge
+# without blocking PR development) and on workflow_dispatch for
+# release-candidate runs.
 #
-# Serial by design: there is exactly one physical Cat9k. A
-# workflow-level concurrency group named "cat9k-device" ensures at
-# most one run uses the device at a time, globally.
+# Serial by design: one physical Cat9k. A workflow-level concurrency
+# group `cat9k-device` ensures at most one run uses the device at a
+# time, globally.
 #
-# Destination: .github/workflows/lab-ci-cat9k.yaml in the
-# cisco-virtual-kubelet repo (or your fork).
+# Single shared `cvk` helm release in `cvk-system` — see
+# lab-ci-cat8kv.yaml for the rationale.
 
 name: Lab CI (Cat9k)
 
@@ -19,7 +18,6 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Different group key than Cat8kv — serializes globally on the Cat9k.
   group: cat9k-device
   cancel-in-progress: false
 
@@ -31,6 +29,8 @@ jobs:
       SHA: ${{ github.sha }}
       U12: cisco@192.0.2.39
       SSH_KEY: /home/cisco/.ssh/argo_to_u12
+      NS: cvk-system
+      REL: cvk
 
     steps:
       - uses: actions/checkout@v4
@@ -40,9 +40,11 @@ jobs:
         run: |
           set -euo pipefail
           TAG="mq-${SHA:0:12}"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          echo "NS=cvk-$TAG"  >> "$GITHUB_ENV"
-          echo "REL=cvk-$TAG" >> "$GITHUB_ENV"
+          CR_NAME="cat9k-mq-${SHA:0:12}"
+          POD_NAME="lab-ci-mq-${SHA:0:12}"
+          echo "TAG=$TAG"           >> "$GITHUB_ENV"
+          echo "CR_NAME=$CR_NAME"   >> "$GITHUB_ENV"
+          echo "POD_NAME=$POD_NAME" >> "$GITHUB_ENV"
           git ls-files -z | tar --null -cf - -T - \
             | ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$U12" \
                 "rm -rf ~/cvk-mq && mkdir ~/cvk-mq && tar -xf - -C ~/cvk-mq"
@@ -57,16 +59,19 @@ jobs:
             rm -f /tmp/cvk-${TAG}.tar
           "
 
-      - name: Helm install CVK
+      - name: Helm upgrade --install CVK
         run: |
           ssh -i "$SSH_KEY" "$U12" "
+            set -euo pipefail
             cd ~/cvk-mq
-            helm install ${REL} ./charts/cisco-virtual-kubelet \
+            helm upgrade --install ${REL} ./charts/cisco-virtual-kubelet \
               --namespace ${NS} --create-namespace \
               --set image.repository=cisco-vk \
               --set image.tag=${TAG} \
               --set image.pullPolicy=Never \
               --wait --timeout 3m
+            kubectl -n ${NS} rollout status \
+              deploy/${REL}-cisco-virtual-kubelet-controller --timeout=2m
           "
 
       - name: Clean any stale app-hosting state on Cat9k
@@ -103,7 +108,7 @@ jobs:
           apiVersion: cisco.vk/v1alpha1
           kind: CiscoDevice
           metadata:
-            name: cat9k-test
+            name: ${CR_NAME}
             namespace: ${NS}
           spec:
             driver: XE
@@ -123,20 +128,20 @@ jobs:
           YAML
 
           for i in \$(seq 1 30); do
-            kubectl get node cat9k-test >/dev/null 2>&1 && \
-            [ "\$(kubectl get node cat9k-test -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ] && break
+            kubectl get node ${CR_NAME} >/dev/null 2>&1 && \
+            [ "\$(kubectl get node ${CR_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ] && break
             sleep 5
           done
-          kubectl get node cat9k-test
+          kubectl get node ${CR_NAME}
 
           kubectl apply -n default -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata:
-            name: lab-ci-${TAG}
+            name: ${POD_NAME}
             namespace: default
           spec:
-            nodeSelector: { kubernetes.io/hostname: cat9k-test }
+            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
             tolerations:
             - key: virtual-kubelet.io/provider
               operator: Exists
@@ -149,8 +154,8 @@ jobs:
               image: flash:/hello-app.iosxe.tar
           YAML
 
-          kubectl -n default wait --for=condition=Ready pod/lab-ci-${TAG} --timeout=15m
-          kubectl -n default get pod lab-ci-${TAG} -o wide
+          kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=15m
+          kubectl -n default get pod ${POD_NAME} -o wide
           REMOTE
 
       - name: Teardown (always)
@@ -158,10 +163,8 @@ jobs:
         run: |
           ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE || true
           set -u
-          kubectl -n default delete pod lab-ci-${TAG} --ignore-not-found --wait=false || true
-          kubectl -n ${NS} delete ciscodevice --all --ignore-not-found --wait=false || true
-          helm uninstall ${REL} --namespace ${NS} --wait || true
-          kubectl delete namespace ${NS} --ignore-not-found --wait=false || true
+          kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false || true
+          kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false || true
           sudo k3s ctr images rm docker.io/library/cisco-vk:${TAG} || true
           rm -rf ~/cvk-mq || true
           REMOTE
