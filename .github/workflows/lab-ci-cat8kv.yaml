@@ -177,26 +177,34 @@ jobs:
         env:
           SSH_OPTS: "-i /home/cisco/.ssh/argo_to_u12 -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
         run: |
-          # Split teardown into discrete ssh calls so a single hang
-          # (seen intermittently in a bash -s heredoc stream) only
-          # affects one step. Each call is short; all tolerate
-          # ignore-not-found / nonzero exit.
+          # Each ssh call wrapped in `timeout` so any single hang is
+          # bounded (observed: a kubectl delete via ssh once hung for
+          # 15+ min even though `kubectl delete --wait=false` returns
+          # in <1s when invoked directly. ServerAliveInterval keeps
+          # TCP alive but doesn't kill a hung command — `timeout`
+          # does).
+          run_ssh() {
+            local seconds=$1; shift
+            timeout "$seconds" ssh $SSH_OPTS "$U12" "$@" \
+              || echo "  ! step exited non-zero or timed out after ${seconds}s"
+          }
+
           echo "teardown: deleting test Pod"
-          ssh $SSH_OPTS "$U12" "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false" || true
+          run_ssh 30 "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false"
 
           echo "teardown: deleting CiscoDevice (controller cascade cleans up VK Node + Deployment)"
-          ssh $SSH_OPTS "$U12" "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false" || true
+          run_ssh 30 "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false"
 
           echo "teardown: GC'ing old pr-* images (keep current ${TAG})"
-          ssh $SSH_OPTS "$U12" "
+          run_ssh 120 "
             CURRENT=docker.io/library/cisco-vk:${TAG}
             sudo k3s ctr images ls -q | \
               awk -v cur=\"\$CURRENT\" '/docker.io\\/library\\/cisco-vk:pr-/ && \$0 != cur' | \
               xargs -r -n1 sudo k3s ctr images rm
-          " || true
+          "
 
           echo "teardown: removing source tree"
-          ssh $SSH_OPTS "$U12" "rm -rf ~/cvk-pr" || true
+          run_ssh 15 "rm -rf ~/cvk-pr"
 
           echo "teardown: done"
 

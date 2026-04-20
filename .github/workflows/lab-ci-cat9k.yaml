@@ -163,21 +163,27 @@ jobs:
         env:
           SSH_OPTS: "-i /home/cisco/.ssh/argo_to_u12 -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
         run: |
+          run_ssh() {
+            local seconds=$1; shift
+            timeout "$seconds" ssh $SSH_OPTS "$U12" "$@" \
+              || echo "  ! step exited non-zero or timed out after ${seconds}s"
+          }
+
           echo "teardown: deleting test Pod"
-          ssh $SSH_OPTS "$U12" "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false" || true
+          run_ssh 30 "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false"
 
           echo "teardown: deleting CiscoDevice"
-          ssh $SSH_OPTS "$U12" "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false" || true
+          run_ssh 30 "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false"
 
           echo "teardown: GC'ing old pr-/mq- images (keep current ${TAG})"
-          ssh $SSH_OPTS "$U12" "
+          run_ssh 120 "
             CURRENT=docker.io/library/cisco-vk:${TAG}
             sudo k3s ctr images ls -q | \
               awk -v cur=\"\$CURRENT\" '/docker.io\\/library\\/cisco-vk:(pr|mq)-/ && \$0 != cur' | \
               xargs -r -n1 sudo k3s ctr images rm
-          " || true
+          "
 
           echo "teardown: removing source tree"
-          ssh $SSH_OPTS "$U12" "rm -rf ~/cvk-mq" || true
+          run_ssh 15 "rm -rf ~/cvk-mq"
 
           echo "teardown: done"
