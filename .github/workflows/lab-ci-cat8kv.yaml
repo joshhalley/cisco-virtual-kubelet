@@ -179,10 +179,13 @@ jobs:
           set -u
           kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false || true
           kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false || true
-          # Do NOT uninstall the shared cvk release — it stays for the
-          # next PR. Do drop the PR-specific image from containerd so
-          # disk doesn't fill.
-          sudo k3s ctr images rm docker.io/library/cisco-vk:${TAG} || true
+          # Do NOT uninstall the shared cvk release and do NOT remove
+          # the current PR's image — the controller deployment still
+          # references it. GC OLD pr-* images (keep the current one).
+          CURRENT="docker.io/library/cisco-vk:${TAG}"
+          sudo k3s ctr images ls -q 2>/dev/null \
+            | awk '/docker.io\/library\/cisco-vk:pr-/ && $0 != "'"$CURRENT"'"' \
+            | xargs -r -n1 sudo k3s ctr images rm || true
           rm -rf ~/cvk-pr || true
           REMOTE
 

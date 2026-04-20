@@ -165,6 +165,11 @@ jobs:
           set -u
           kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false || true
           kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false || true
-          sudo k3s ctr images rm docker.io/library/cisco-vk:${TAG} || true
+          # GC old tags only; keep the current one in case the
+          # controller deployment still references it.
+          CURRENT="docker.io/library/cisco-vk:${TAG}"
+          sudo k3s ctr images ls -q 2>/dev/null \
+            | awk '/docker.io\/library\/cisco-vk:(pr|mq)-/ && $0 != "'"$CURRENT"'"' \
+            | xargs -r -n1 sudo k3s ctr images rm || true
           rm -rf ~/cvk-mq || true
           REMOTE
