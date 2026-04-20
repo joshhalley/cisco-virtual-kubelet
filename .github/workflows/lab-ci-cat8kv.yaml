@@ -174,20 +174,31 @@ jobs:
 
       - name: Teardown (always runs)
         if: always()
+        env:
+          SSH_OPTS: "-i /home/cisco/.ssh/argo_to_u12 -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
         run: |
-          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE || true
-          set -u
-          kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false || true
-          kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false || true
-          # Do NOT uninstall the shared cvk release and do NOT remove
-          # the current PR's image — the controller deployment still
-          # references it. GC OLD pr-* images (keep the current one).
-          CURRENT="docker.io/library/cisco-vk:${TAG}"
-          sudo k3s ctr images ls -q 2>/dev/null \
-            | awk '/docker.io\/library\/cisco-vk:pr-/ && $0 != "'"$CURRENT"'"' \
-            | xargs -r -n1 sudo k3s ctr images rm || true
-          rm -rf ~/cvk-pr || true
-          REMOTE
+          # Split teardown into discrete ssh calls so a single hang
+          # (seen intermittently in a bash -s heredoc stream) only
+          # affects one step. Each call is short; all tolerate
+          # ignore-not-found / nonzero exit.
+          echo "teardown: deleting test Pod"
+          ssh $SSH_OPTS "$U12" "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false" || true
+
+          echo "teardown: deleting CiscoDevice (controller cascade cleans up VK Node + Deployment)"
+          ssh $SSH_OPTS "$U12" "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false" || true
+
+          echo "teardown: GC'ing old pr-* images (keep current ${TAG})"
+          ssh $SSH_OPTS "$U12" "
+            CURRENT=docker.io/library/cisco-vk:${TAG}
+            sudo k3s ctr images ls -q | \
+              awk -v cur=\"\$CURRENT\" '/docker.io\\/library\\/cisco-vk:pr-/ && \$0 != cur' | \
+              xargs -r -n1 sudo k3s ctr images rm
+          " || true
+
+          echo "teardown: removing source tree"
+          ssh $SSH_OPTS "$U12" "rm -rf ~/cvk-pr" || true
+
+          echo "teardown: done"
 
       - name: Collect diagnostics on failure
         if: failure()
