@@ -1,0 +1,167 @@
+# Pre-merge device validation on physical Cat9k (Tier 3).
+#
+# Triggers:
+#   - GitHub merge queue event (preferred — gates merge into main
+#     without blocking concurrent PR development)
+#   - workflow_dispatch (manual release-candidate runs)
+#
+# Serial by design: there is exactly one physical Cat9k. A
+# workflow-level concurrency group named "cat9k-device" ensures at
+# most one run uses the device at a time, globally.
+#
+# Destination: .github/workflows/lab-ci-cat9k.yaml in the
+# cisco-virtual-kubelet repo (or your fork).
+
+name: Lab CI (Cat9k)
+
+on:
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  # Different group key than Cat8kv — serializes globally on the Cat9k.
+  group: cat9k-device
+  cancel-in-progress: false
+
+jobs:
+  cat9k:
+    runs-on: [self-hosted, lab-cvk]
+    timeout-minutes: 40
+    env:
+      SHA: ${{ github.sha }}
+      U12: cisco@192.0.2.39
+      SSH_KEY: /home/cisco/.ssh/argo_to_u12
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Stage source onto ubuntu12
+        run: |
+          set -euo pipefail
+          TAG="mq-${SHA:0:12}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "NS=cvk-$TAG"  >> "$GITHUB_ENV"
+          echo "REL=cvk-$TAG" >> "$GITHUB_ENV"
+          git ls-files -z | tar --null -cf - -T - \
+            | ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$U12" \
+                "rm -rf ~/cvk-mq && mkdir ~/cvk-mq && tar -xf - -C ~/cvk-mq"
+
+      - name: Build CVK image
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "
+            cd ~/cvk-mq
+            docker build -t cisco-vk:${TAG} .
+            docker save cisco-vk:${TAG} -o /tmp/cvk-${TAG}.tar
+            sudo k3s ctr images import /tmp/cvk-${TAG}.tar
+            rm -f /tmp/cvk-${TAG}.tar
+          "
+
+      - name: Helm install CVK
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "
+            cd ~/cvk-mq
+            helm install ${REL} ./charts/cisco-virtual-kubelet \
+              --namespace ${NS} --create-namespace \
+              --set image.repository=cisco-vk \
+              --set image.tag=${TAG} \
+              --set image.pullPolicy=Never \
+              --wait --timeout 3m
+          "
+
+      - name: Clean any stale app-hosting state on Cat9k
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<'REMOTE'
+          set -eu
+          curl -k -sS -u AI_AGENT_RW:cisco \
+            "https://198.51.100.102/restconf/data/Cisco-IOS-XE-app-hosting-oper:app-hosting-oper-data/apps" \
+            -H "Accept: application/yang-data+json" \
+            | python3 -c '
+          import json,sys,subprocess
+          d=json.load(sys.stdin)
+          key=next((k for k in d if "apps" in k),None)
+          apps=(d.get(key,{}).get("app",[]) if key else [])
+          for a in apps:
+              name=a.get("name","")
+              if name.startswith("cvk0000_"):
+                  for op in ("stop","deactivate","uninstall"):
+                      subprocess.run(
+                        ["curl","-k","-sS","-u","AI_AGENT_RW:cisco","-X","POST",
+                         "https://198.51.100.102/restconf/operations/Cisco-IOS-XE-rpc:app-hosting",
+                         "-H","Content-Type: application/yang-data+json",
+                         "-H","Accept: application/yang-data+json",
+                         "-d", json.dumps({"Cisco-IOS-XE-rpc:input":{op:{"appid":name}}})],
+                        check=False)
+          '
+          REMOTE
+
+      - name: Apply CiscoDevice + hello-app Pod, wait for Running
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
+          set -euo pipefail
+          kubectl apply -n ${NS} -f - <<'YAML'
+          apiVersion: cisco.vk/v1alpha1
+          kind: CiscoDevice
+          metadata:
+            name: cat9k-test
+            namespace: ${NS}
+          spec:
+            driver: XE
+            address: "198.51.100.102"
+            port: 443
+            username: AI_AGENT_RW
+            password: cisco
+            tls: { enabled: true, insecureSkipVerify: true }
+            xe:
+              networking:
+                interface:
+                  type: AppGigabitEthernet
+                  appGigabitEthernet:
+                    mode: access
+                    dhcp: true
+                    guestInterface: 0
+          YAML
+
+          for i in \$(seq 1 30); do
+            kubectl get node cat9k-test >/dev/null 2>&1 && \
+            [ "\$(kubectl get node cat9k-test -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ] && break
+            sleep 5
+          done
+          kubectl get node cat9k-test
+
+          kubectl apply -n default -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: lab-ci-${TAG}
+            namespace: default
+          spec:
+            nodeSelector: { kubernetes.io/hostname: cat9k-test }
+            tolerations:
+            - key: virtual-kubelet.io/provider
+              operator: Exists
+            - key: node.kubernetes.io/not-ready
+              operator: Exists
+            - key: node.kubernetes.io/unreachable
+              operator: Exists
+            containers:
+            - name: hello
+              image: flash:/hello-app.iosxe.tar
+          YAML
+
+          kubectl -n default wait --for=condition=Ready pod/lab-ci-${TAG} --timeout=15m
+          kubectl -n default get pod lab-ci-${TAG} -o wide
+          REMOTE
+
+      - name: Teardown (always)
+        if: always()
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE || true
+          set -u
+          kubectl -n default delete pod lab-ci-${TAG} --ignore-not-found --wait=false || true
+          kubectl -n ${NS} delete ciscodevice --all --ignore-not-found --wait=false || true
+          helm uninstall ${REL} --namespace ${NS} --wait || true
+          kubectl delete namespace ${NS} --ignore-not-found --wait=false || true
+          sudo k3s ctr images rm docker.io/library/cisco-vk:${TAG} || true
+          rm -rf ~/cvk-mq || true
+          REMOTE
