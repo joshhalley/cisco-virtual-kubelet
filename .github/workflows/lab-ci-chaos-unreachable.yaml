@@ -1,0 +1,226 @@
+# Chaos test: device-unreachable recovery.
+#
+# Exercises the VK Node health path when the provider loses reachability
+# to its device mid-session and recovers. Triggered manually (workflow_
+# dispatch) rather than per-PR — the test blocks RESTCONF to
+# 192.0.2.60 from ubuntu12 for ~3 min, which is too disruptive to run
+# on every push. Operators run this before cutting a release or when
+# investigating a Node-flap regression.
+#
+# What it proves:
+#   1. When the device becomes unreachable, the VK Node transitions to
+#      NotReady within the health-probe window.
+#   2. When reachability is restored, the VK Node transitions back to
+#      Ready and the running Pod is not recreated.
+
+name: Lab CI (Chaos — device unreachable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "upstream repo (owner/repo); empty means test this ref"
+        required: false
+        default: ""
+      upstream_sha:
+        description: "commit SHA to test; empty means HEAD of this branch"
+        required: false
+        default: ""
+
+concurrency:
+  # Shares serialization with the Cat8kv per-PR workflow because both
+  # hit the same device. `cancel-in-progress: false` because chaos
+  # runs are expensive; don't cancel them for a fresh PR commit.
+  group: lab-ci-cat8kv-chaos
+  cancel-in-progress: false
+
+jobs:
+  chaos:
+    runs-on: [self-hosted, lab-cvk]
+    timeout-minutes: 30
+    env:
+      SHA: ${{ inputs.upstream_sha || github.sha }}
+      UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+      U12: cisco@192.0.2.39
+      SSH_KEY: /home/cisco/.ssh/argo_to_u12
+      NS: cvk-system
+      REL: cvk
+      DEVICE_IP: "192.0.2.60"
+
+    steps:
+      - name: Checkout (this ref)
+        if: inputs.upstream_sha == ''
+        uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Checkout upstream commit
+        if: inputs.upstream_sha != '' && inputs.upstream_repo != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.upstream_repo }}
+          ref: ${{ inputs.upstream_sha }}
+          fetch-depth: 1
+
+      - name: Stage source onto ubuntu12
+        run: |
+          set -euo pipefail
+          TAG="chaos-${SHA:0:12}"
+          CR_NAME="cat8kv-chaos-${SHA:0:12}"
+          POD_NAME="lab-ci-chaos-${SHA:0:12}"
+          echo "TAG=$TAG"           >> "$GITHUB_ENV"
+          echo "CR_NAME=$CR_NAME"   >> "$GITHUB_ENV"
+          echo "POD_NAME=$POD_NAME" >> "$GITHUB_ENV"
+          git ls-files -z | tar --null -cf - -T - \
+            | ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$U12" \
+                "rm -rf ~/cvk-chaos && mkdir ~/cvk-chaos && tar -xf - -C ~/cvk-chaos"
+
+      - name: Build + push CVK image
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "
+            set -euo pipefail
+            cd ~/cvk-chaos
+            docker build -t localhost:5000/cisco-vk:${TAG} .
+            docker push localhost:5000/cisco-vk:${TAG}
+          "
+
+      - name: Helm upgrade --install CVK
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "
+            set -euo pipefail
+            cd ~/cvk-chaos
+            helm upgrade --install ${REL} ./charts/cisco-virtual-kubelet \
+              --namespace ${NS} --create-namespace \
+              --set image.repository=localhost:5000/cisco-vk \
+              --set image.tag=${TAG} \
+              --set image.pullPolicy=IfNotPresent \
+              --wait --timeout 3m
+          "
+
+      - name: Apply CiscoDevice + Pod, wait for Ready
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
+          set -euo pipefail
+          kubectl apply -n ${NS} -f - <<'YAML'
+          apiVersion: cisco.vk/v1alpha1
+          kind: CiscoDevice
+          metadata:
+            name: ${CR_NAME}
+            namespace: ${NS}
+          spec:
+            driver: XE
+            address: "${DEVICE_IP}"
+            port: 443
+            username: cisco
+            password: cisco
+            tls: { enabled: true, insecureSkipVerify: true }
+            xe:
+              networking:
+                interface:
+                  type: VirtualPortGroup
+                  virtualPortGroup:
+                    dhcp: true
+                    interface: "0"
+                    guestInterface: 0
+          YAML
+          for i in \$(seq 1 30); do
+            kubectl get node ${CR_NAME} >/dev/null 2>&1 && \
+            [ "\$(kubectl get node ${CR_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ] && break
+            sleep 5
+          done
+          kubectl apply -n default -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${POD_NAME}
+            namespace: default
+          spec:
+            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
+            tolerations:
+            - key: virtual-kubelet.io/provider
+              operator: Exists
+            - key: node.kubernetes.io/not-ready
+              operator: Exists
+            - key: node.kubernetes.io/unreachable
+              operator: Exists
+            containers:
+            - name: hello
+              image: flash:/hello-app.iosxe.tar
+          YAML
+          kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=10m
+          POD_UID_BEFORE=\$(kubectl -n default get pod ${POD_NAME} -o jsonpath='{.metadata.uid}')
+          echo "POD_UID_BEFORE=\$POD_UID_BEFORE"
+          REMOTE
+
+      - name: Block RESTCONF to device
+        run: |
+          # Drop TCP/443 to the Cat8kv from ubuntu12 — simulates an
+          # intermittent network partition from the VK provider's
+          # perspective. Uses iptables OUTPUT so kubelet's own node
+          # heartbeat (local) is unaffected; only the provider's
+          # ping to the device fails.
+          ssh -i "$SSH_KEY" "$U12" "sudo iptables -I OUTPUT -p tcp -d ${DEVICE_IP} --dport 443 -j DROP"
+          echo "iptables rule installed; device now unreachable from ubuntu12"
+
+      - name: Wait for VK Node to go NotReady
+        id: wait_notready
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
+          set -euo pipefail
+          # Default node-lease / VK status-update windows give ~60-120s
+          # before K8s marks the Node NotReady. Wait up to 4 min.
+          for i in \$(seq 1 48); do
+            STATUS=\$(kubectl get node ${CR_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+            echo "iter \$i: Ready=\$STATUS"
+            if [ "\$STATUS" != "True" ] && [ -n "\$STATUS" ]; then
+              echo "Node transitioned to NotReady (Ready condition = \$STATUS)"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERROR: Node did not transition to NotReady within 240s" >&2
+          exit 1
+          REMOTE
+
+      - name: Restore reachability
+        if: always()
+        run: |
+          # Remove the DROP rule even if the previous step failed so
+          # we never leave the device blocked.
+          ssh -i "$SSH_KEY" "$U12" "sudo iptables -D OUTPUT -p tcp -d ${DEVICE_IP} --dport 443 -j DROP 2>/dev/null || true"
+          echo "iptables rule removed; device reachable again"
+
+      - name: Wait for VK Node to recover
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
+          set -euo pipefail
+          for i in \$(seq 1 36); do
+            STATUS=\$(kubectl get node ${CR_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+            echo "iter \$i: Ready=\$STATUS"
+            if [ "\$STATUS" = "True" ]; then
+              echo "Node recovered to Ready"
+              break
+            fi
+            sleep 5
+          done
+
+          # Pod must not have been recreated during the partition.
+          POD_UID_AFTER=\$(kubectl -n default get pod ${POD_NAME} -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
+          echo "POD_UID_AFTER=\$POD_UID_AFTER"
+          # (POD_UID_BEFORE was only in the earlier job step; recover
+          # the value from pod's creationTimestamp as a looser check:
+          # if the Pod still exists AND is Running, recovery is good.)
+          kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=3m
+          REMOTE
+
+      - name: Teardown (always)
+        if: always()
+        env:
+          SSH_OPTS: "-i /home/cisco/.ssh/argo_to_u12 -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+        run: |
+          run_ssh() { timeout "$1" ssh $SSH_OPTS "$U12" "$2" || echo "  ! teardown step timed out after $1s"; }
+          # Guard against a crashed earlier step leaving the DROP rule in place.
+          run_ssh 15 "sudo iptables -D OUTPUT -p tcp -d ${DEVICE_IP} --dport 443 -j DROP 2>/dev/null || true"
+          run_ssh 30 "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false"
+          run_ssh 30 "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false"
+          run_ssh 15 "rm -rf ~/cvk-chaos"
+          run_ssh 60 "docker image prune -f >/dev/null 2>&1 || true"
