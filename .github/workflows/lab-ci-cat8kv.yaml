@@ -164,6 +164,32 @@ jobs:
           '
           REMOTE
 
+      - name: Wait for Cat8kv to quiesce (no cvk0000_* apps)
+        run: |
+          # RESTCONF stop/deactivate/uninstall calls return before
+          # the device has actually finished teardown. A fresh CR
+          # applied during that window races with the device's own
+          # cleanup and the VK Node never registers (observed flake
+          # on back-to-back PR runs, PR#12 on 2026-04-21).
+          # Poll oper-data until zero cvk0000_* apps remain.
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<'REMOTE'
+          set -eu
+          for i in $(seq 1 24); do  # up to 2 min
+            COUNT=$(curl -k -sS -u cisco:cisco \
+              "https://192.0.2.60/restconf/data/Cisco-IOS-XE-app-hosting-oper:app-hosting-oper-data/apps" \
+              -H "Accept: application/yang-data+json" \
+              | python3 -c 'import json,sys
+          d=json.load(sys.stdin)
+          k=next((k for k in d if "apps" in k), None)
+          a = d.get(k, {}).get("app", []) if k else []
+          print(sum(1 for x in a if x.get("name", "").startswith("cvk0000_")))')
+            echo "iter $i: cvk0000_* apps remaining: $COUNT"
+            [ "$COUNT" = "0" ] && exit 0
+            sleep 5
+          done
+          echo "WARNING: device still has cvk0000_* apps after 2m — proceeding anyway"
+          REMOTE
+
       - name: Apply CiscoDevice + hello-app Pod, wait for Running
         run: |
           ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE

@@ -14,10 +14,14 @@
 name: Lab CI (Cat9k)
 
 on:
+  # Every PR on the fork runs this. Together with lab-ci-cat8kv.yaml
+  # this guarantees both physical tiers validate the PR before merge.
+  pull_request:
+    branches: [main]
   merge_group:
-  # Dispatched by the upstream-PR bridge when a PR on
-  # cisco-open/cisco-virtual-kubelet carries the `test-cat9k` label
-  # (bridge filters). Also manually via `gh workflow run`.
+  # Also dispatched by the upstream-PR bridge for every new head SHA
+  # on cisco-open/cisco-virtual-kubelet open PRs, and manually via
+  # `gh workflow run`.
   workflow_dispatch:
     inputs:
       upstream_repo:
@@ -140,6 +144,26 @@ jobs:
                          "-d", json.dumps({"Cisco-IOS-XE-rpc:input":{op:{"appid":name}}})],
                         check=False)
           '
+          REMOTE
+
+      - name: Wait for Cat9k to quiesce (no cvk0000_* apps)
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<'REMOTE'
+          set -eu
+          for i in $(seq 1 24); do
+            COUNT=$(curl -k -sS -u AI_AGENT_RW:cisco \
+              "https://198.51.100.102/restconf/data/Cisco-IOS-XE-app-hosting-oper:app-hosting-oper-data/apps" \
+              -H "Accept: application/yang-data+json" \
+              | python3 -c 'import json,sys
+          d=json.load(sys.stdin)
+          k=next((k for k in d if "apps" in k), None)
+          a = d.get(k, {}).get("app", []) if k else []
+          print(sum(1 for x in a if x.get("name", "").startswith("cvk0000_")))')
+            echo "iter $i: cvk0000_* apps remaining: $COUNT"
+            [ "$COUNT" = "0" ] && exit 0
+            sleep 5
+          done
+          echo "WARNING: device still has cvk0000_* apps after 2m — proceeding anyway"
           REMOTE
 
       - name: Apply CiscoDevice + hello-app Pod, wait for Running
