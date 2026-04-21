@@ -228,7 +228,27 @@ jobs:
           echo "teardown: removing source tree"
           run_ssh 15 "rm -rf ~/cvk-mq"
 
+          echo "teardown: pruning dangling docker layers on ubuntu12"
+          run_ssh 60 "docker image prune -f >/dev/null 2>&1 || true"
+
           echo "teardown: done"
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE > diagnostics.txt 2>&1 || true
+          kubectl get nodes -o wide
+          kubectl get pods -A
+          kubectl get ciscodevices -A
+          kubectl -n ${NS} describe deploy ${REL}-cisco-virtual-kubelet-controller || true
+          kubectl -n ${NS} logs deploy/${REL}-cisco-virtual-kubelet-controller --tail=200 || true
+          kubectl -n default describe pod ${POD_NAME} || true
+          REMOTE
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-cat9k
+          path: diagnostics.txt
 
       - name: Post final status to upstream PR
         if: always() && inputs.upstream_sha != '' && inputs.upstream_repo != ''
