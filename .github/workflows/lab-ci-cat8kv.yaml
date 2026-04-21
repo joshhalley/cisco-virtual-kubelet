@@ -255,6 +255,9 @@ jobs:
           echo "teardown: removing source tree"
           run_ssh 15 "rm -rf ~/cvk-pr"
 
+          echo "teardown: pruning dangling docker layers on ubuntu12"
+          run_ssh 60 "docker image prune -f >/dev/null 2>&1 || true"
+
           echo "teardown: done"
 
       - name: Collect diagnostics on failure
