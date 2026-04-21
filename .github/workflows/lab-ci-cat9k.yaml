@@ -35,7 +35,10 @@ jobs:
     runs-on: [self-hosted, lab-cvk]
     timeout-minutes: 40
     env:
-      SHA: ${{ inputs.upstream_sha || github.sha }}
+      # Pull-request events: use PR head SHA (not the merge commit
+      # github.sha computes) so cat8kv and cat9k agree on the image
+      # tag and don't race the shared `cvk` helm release.
+      SHA: ${{ inputs.upstream_sha || github.event.pull_request.head.sha || github.sha }}
       UPSTREAM_REPO: ${{ inputs.upstream_repo || github.repository }}
       UPSTREAM_PR: ${{ inputs.upstream_pr }}
       UPSTREAM_SHA: ${{ inputs.upstream_sha }}
