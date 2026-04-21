@@ -259,6 +259,85 @@ jobs:
           kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=2m
           REMOTE
 
+      - name: Multi-container Pod scenario
+        run: |
+          # Exercises pod_lifecycle's per-container AppID loop: the
+          # controller must generate two distinct AppIDs from the same
+          # pod UID, install both, and surface both containerStatuses
+          # as Ready. If the per-container loop regresses (e.g. AppID
+          # collision, sequential bug, or delete-path forgets one) the
+          # wait times out here.
+          MULTI_NAME="lab-ci-${SHA:0:12}-multi"
+          echo "MULTI_NAME=$MULTI_NAME" >> "$GITHUB_ENV"
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
+          set -euo pipefail
+          kubectl apply -n default -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${MULTI_NAME}
+            namespace: default
+            labels: { labci-scenario: multi-container }
+          spec:
+            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
+            tolerations:
+            - key: virtual-kubelet.io/provider
+              operator: Exists
+            - key: node.kubernetes.io/not-ready
+              operator: Exists
+            - key: node.kubernetes.io/unreachable
+              operator: Exists
+            containers:
+            - name: alpha
+              image: flash:/hello-app.iosxe.tar
+            - name: beta
+              image: flash:/hello-app.iosxe.tar
+          YAML
+          kubectl -n default wait --for=condition=Ready pod/${MULTI_NAME} --timeout=8m
+          READY=\$(kubectl -n default get pod ${MULTI_NAME} -o 'jsonpath={range .status.containerStatuses[*]}{.name}={.ready} {end}')
+          echo "container readiness: \$READY"
+          [ "\$(kubectl -n default get pod ${MULTI_NAME} -o jsonpath='{.status.containerStatuses[?(@.name=="alpha")].ready}')" = "true" ]
+          [ "\$(kubectl -n default get pod ${MULTI_NAME} -o jsonpath='{.status.containerStatuses[?(@.name=="beta")].ready}')" = "true" ]
+          REMOTE
+
+      - name: Concurrent Pods scenario
+        run: |
+          # Two separate Pod objects on the same VK Node. Tests that
+          # CVK's per-pod reconcile handles multiple AppIDs from
+          # different pod UIDs without collision, and that the device
+          # supports two simultaneously-installed apps.
+          C1="lab-ci-${SHA:0:12}-c1"
+          C2="lab-ci-${SHA:0:12}-c2"
+          echo "C1=$C1" >> "$GITHUB_ENV"
+          echo "C2=$C2" >> "$GITHUB_ENV"
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
+          set -euo pipefail
+          for NAME in ${C1} ${C2}; do
+            kubectl apply -n default -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: \$NAME
+            namespace: default
+            labels: { labci-scenario: concurrent }
+          spec:
+            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
+            tolerations:
+            - key: virtual-kubelet.io/provider
+              operator: Exists
+            - key: node.kubernetes.io/not-ready
+              operator: Exists
+            - key: node.kubernetes.io/unreachable
+              operator: Exists
+            containers:
+            - name: hello
+              image: flash:/hello-app.iosxe.tar
+          YAML
+          done
+          kubectl -n default wait --for=condition=Ready pod/${C1} pod/${C2} --timeout=10m
+          kubectl -n default get pod ${C1} ${C2} -o wide
+          REMOTE
+
       - name: Teardown (always runs)
         if: always()
         env:
@@ -278,6 +357,9 @@ jobs:
 
           echo "teardown: deleting test Pod"
           run_ssh 30 "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false"
+
+          echo "teardown: deleting scenario Pods (multi-container / concurrent)"
+          run_ssh 30 "kubectl -n default delete pod -l labci-scenario --ignore-not-found --wait=false"
 
           echo "teardown: deleting CiscoDevice (controller cascade cleans up VK Node + Deployment)"
           run_ssh 30 "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false"
