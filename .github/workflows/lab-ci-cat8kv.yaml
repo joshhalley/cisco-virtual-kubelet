@@ -63,9 +63,14 @@ jobs:
     steps:
       - name: Post pending status to upstream PR
         if: inputs.upstream_sha != '' && inputs.upstream_repo != ''
+        continue-on-error: true  # don't abort the test if the secret isn't set
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_STATUS_TOKEN }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::UPSTREAM_STATUS_TOKEN secret missing; skipping status post"
+            exit 0
+          fi
           gh api -X POST "repos/${UPSTREAM_REPO}/statuses/${UPSTREAM_SHA}" \
             -f state=pending \
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
@@ -271,11 +276,14 @@ jobs:
 
       - name: Post final status to upstream PR
         if: always() && inputs.upstream_sha != '' && inputs.upstream_repo != ''
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_STATUS_TOKEN }}
         run: |
-          # job.status is success/failure/cancelled; upstream expects
-          # success/failure/error/pending. Map cancelled → error.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::UPSTREAM_STATUS_TOKEN secret missing; skipping status post"
+            exit 0
+          fi
           case "${{ job.status }}" in
             success)   STATE=success; DESC="Lab CI Cat8kv passed" ;;
             failure)   STATE=failure; DESC="Lab CI Cat8kv failed" ;;
