@@ -1,0 +1,72 @@
+# Tier 1 — fast, hermetic, runs on GitHub-hosted Linux.
+# No devices, no lab. Blocks merges on trivial Go regressions.
+#
+# Destination: .github/workflows/ci.yaml in the
+# cisco-virtual-kubelet repo (or your fork).
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race, coverage)
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  lint:
+    # Advisory at first — flip to required once existing violations
+    # are cleaned up on main.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  vuln:
+    # Advisory: govulncheck reports transitively from go.sum; treat
+    # findings as input for a follow-up PR, not a merge blocker.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

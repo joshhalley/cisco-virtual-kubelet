@@ -1,0 +1,226 @@
+# Pre-merge device validation on Cat8kv (Tier 2).
+#
+# Every PR: build the PR's CVK on ubuntu12, upgrade the single shared
+# `cvk` helm release in `cvk-system` to the PR's image, reconcile a
+# CiscoDevice against 192.0.2.60, and assert hello-app Pod reaches
+# Ready. All CVK/docker/helm work stays on ubuntu12 per the hard-split
+# rule; the self-hosted runner on svr-xl orchestrates.
+#
+# Shared-release rationale: the chart creates cluster-scoped
+# ClusterRole `cisco-virtual-kubelet-controller` by a fixed name —
+# two concurrent helm releases cannot both own it. Instead a single
+# `cvk` release lives in `cvk-system` and each PR `helm upgrade
+# --install`s it to its own image tag. Per-PR isolation is at the
+# image-tag + CiscoDevice + Pod level, not the release.
+
+name: Lab CI (Cat8kv)
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Serialize per PR branch — a new commit cancels the in-flight run.
+  group: lab-ci-cat8kv-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cat8kv:
+    runs-on: [self-hosted, lab-cvk]
+    timeout-minutes: 25
+    env:
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      U12: cisco@192.0.2.39
+      SSH_KEY: /home/cisco/.ssh/argo_to_u12
+      NS: cvk-system
+      REL: cvk
+
+    steps:
+      - name: Checkout PR source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Stage source onto ubuntu12
+        run: |
+          set -euo pipefail
+          TAG="pr-${SHA:0:12}"
+          CR_NAME="cat8kv-pr-${SHA:0:12}"
+          POD_NAME="lab-ci-${SHA:0:12}"
+          echo "TAG=$TAG"           >> "$GITHUB_ENV"
+          echo "CR_NAME=$CR_NAME"   >> "$GITHUB_ENV"
+          echo "POD_NAME=$POD_NAME" >> "$GITHUB_ENV"
+
+          git ls-files -z | tar --null -cf - -T - \
+            | ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$U12" \
+                "rm -rf ~/cvk-pr && mkdir ~/cvk-pr && tar -xf - -C ~/cvk-pr"
+
+      - name: Build CVK image on ubuntu12
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "
+            set -euo pipefail
+            cd ~/cvk-pr
+            docker build -t cisco-vk:${TAG} .
+            docker save cisco-vk:${TAG} -o /tmp/cvk-${TAG}.tar
+            sudo k3s ctr images import /tmp/cvk-${TAG}.tar
+            rm -f /tmp/cvk-${TAG}.tar
+          "
+
+      - name: Helm upgrade --install CVK with PR image
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "
+            set -euo pipefail
+            cd ~/cvk-pr
+            helm upgrade --install ${REL} ./charts/cisco-virtual-kubelet \
+              --namespace ${NS} --create-namespace \
+              --set image.repository=cisco-vk \
+              --set image.tag=${TAG} \
+              --set image.pullPolicy=Never \
+              --wait --timeout 3m
+            kubectl -n ${NS} rollout status \
+              deploy/${REL}-cisco-virtual-kubelet-controller --timeout=2m
+          "
+
+      - name: Clean any stale app-hosting state on Cat8kv
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<'REMOTE'
+          set -eu
+          curl -k -sS -u cisco:cisco \
+            "https://192.0.2.60/restconf/data/Cisco-IOS-XE-app-hosting-oper:app-hosting-oper-data/apps" \
+            -H "Accept: application/yang-data+json" \
+            | python3 -c '
+          import json,sys,subprocess
+          d=json.load(sys.stdin)
+          key=next((k for k in d if "apps" in k),None)
+          apps=(d.get(key,{}).get("app",[]) if key else [])
+          for a in apps:
+              name=a.get("name","")
+              if name.startswith("cvk0000_"):
+                  for op in ("stop","deactivate","uninstall"):
+                      subprocess.run(
+                        ["curl","-k","-sS","-u","cisco:cisco","-X","POST",
+                         "https://192.0.2.60/restconf/operations/Cisco-IOS-XE-rpc:app-hosting",
+                         "-H","Content-Type: application/yang-data+json",
+                         "-H","Accept: application/yang-data+json",
+                         "-d", json.dumps({"Cisco-IOS-XE-rpc:input":{op:{"appid":name}}})],
+                        check=False)
+          '
+          REMOTE
+
+      - name: Apply CiscoDevice + hello-app Pod, wait for Running
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
+          set -euo pipefail
+
+          # CiscoDevice lives in the chart's release namespace so the
+          # chart-created VK ServiceAccount is in scope for the pod the
+          # controller spawns per device.
+          kubectl apply -n ${NS} -f - <<'YAML'
+          apiVersion: cisco.vk/v1alpha1
+          kind: CiscoDevice
+          metadata:
+            name: ${CR_NAME}
+            namespace: ${NS}
+          spec:
+            driver: XE
+            address: "192.0.2.60"
+            port: 443
+            username: cisco
+            password: cisco
+            tls: { enabled: true, insecureSkipVerify: true }
+            xe:
+              networking:
+                interface:
+                  type: VirtualPortGroup
+                  virtualPortGroup:
+                    dhcp: true
+                    interface: "0"
+                    guestInterface: 0
+          YAML
+
+          # Wait for the VK Node (named after the CiscoDevice) to
+          # register Ready.
+          for i in \$(seq 1 30); do
+            kubectl get node ${CR_NAME} >/dev/null 2>&1 && \
+            [ "\$(kubectl get node ${CR_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ] && break
+            sleep 5
+          done
+          kubectl get node ${CR_NAME}
+
+          kubectl apply -n default -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${POD_NAME}
+            namespace: default
+          spec:
+            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
+            tolerations:
+            - key: virtual-kubelet.io/provider
+              operator: Exists
+            - key: node.kubernetes.io/not-ready
+              operator: Exists
+            - key: node.kubernetes.io/unreachable
+              operator: Exists
+            containers:
+            - name: hello
+              image: flash:/hello-app.iosxe.tar
+          YAML
+
+          kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=10m
+          kubectl -n default get pod ${POD_NAME} -o wide
+          REMOTE
+
+      - name: Teardown (always runs)
+        if: always()
+        env:
+          SSH_OPTS: "-i /home/cisco/.ssh/argo_to_u12 -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+        run: |
+          # Each ssh call wrapped in `timeout` so any single hang is
+          # bounded (observed: a kubectl delete via ssh once hung for
+          # 15+ min even though `kubectl delete --wait=false` returns
+          # in <1s when invoked directly. ServerAliveInterval keeps
+          # TCP alive but doesn't kill a hung command — `timeout`
+          # does).
+          run_ssh() {
+            local seconds=$1; shift
+            timeout "$seconds" ssh $SSH_OPTS "$U12" "$@" \
+              || echo "  ! step exited non-zero or timed out after ${seconds}s"
+          }
+
+          echo "teardown: deleting test Pod"
+          run_ssh 30 "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false"
+
+          echo "teardown: deleting CiscoDevice (controller cascade cleans up VK Node + Deployment)"
+          run_ssh 30 "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false"
+
+          echo "teardown: GC'ing old pr-* images (keep current ${TAG})"
+          run_ssh 120 "
+            CURRENT=docker.io/library/cisco-vk:${TAG}
+            sudo k3s ctr images ls -q | \
+              awk -v cur=\"\$CURRENT\" '/docker.io\\/library\\/cisco-vk:pr-/ && \$0 != cur' | \
+              xargs -r -n1 sudo k3s ctr images rm
+          "
+
+          echo "teardown: removing source tree"
+          run_ssh 15 "rm -rf ~/cvk-pr"
+
+          echo "teardown: done"
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE > diagnostics.txt 2>&1 || true
+          kubectl get nodes -o wide
+          kubectl get pods -A
+          kubectl get ciscodevices -A
+          kubectl -n ${NS} describe deploy ${REL}-cisco-virtual-kubelet-controller || true
+          kubectl -n ${NS} logs deploy/${REL}-cisco-virtual-kubelet-controller --tail=200 || true
+          kubectl -n default describe pod ${POD_NAME} || true
+          REMOTE
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics
+          path: diagnostics.txt
