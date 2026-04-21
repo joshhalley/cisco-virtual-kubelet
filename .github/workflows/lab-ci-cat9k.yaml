@@ -1,27 +1,16 @@
-# Pre-merge device validation on physical Cat9k (Tier 3).
+# Cat9k lab CI — thin trigger for the cat9k-pr-test Argo
+# WorkflowTemplate.
 #
-# Triggers on GitHub merge queue events (gates the actual merge
-# without blocking PR development) and on workflow_dispatch for
-# release-candidate runs.
-#
-# Serial by design: one physical Cat9k. A workflow-level concurrency
-# group `cat9k-device` ensures at most one run uses the device at a
-# time, globally.
-#
-# Single shared `cvk` helm release in `cvk-system` — see
-# lab-ci-cat8kv.yaml for the rationale.
-
+# Physical Cat9k test. Scope is primary + restart-resilience only;
+# stress scenarios (multi-container, concurrent pods) live on
+# Cat8kv — physical install times are variable and exceed wait
+# windows when 3+ apps stack.
 name: Lab CI (Cat9k)
 
 on:
-  # Every PR on the fork runs this. Together with lab-ci-cat8kv.yaml
-  # this guarantees both physical tiers validate the PR before merge.
   pull_request:
     branches: [main]
   merge_group:
-  # Also dispatched by the upstream-PR bridge for every new head SHA
-  # on cisco-open/cisco-virtual-kubelet open PRs, and manually via
-  # `gh workflow run`.
   workflow_dispatch:
     inputs:
       upstream_repo:
@@ -35,22 +24,22 @@ on:
         default: ""
 
 concurrency:
+  # Serialize globally: one physical Cat9k. A workflow-level group
+  # means at most one run uses the device at a time; the template
+  # also holds cat9k-lab-switch-1 semaphore inside.
   group: cat9k-device
   cancel-in-progress: false
 
 jobs:
   cat9k:
     runs-on: [self-hosted, lab-cvk]
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       SHA: ${{ inputs.upstream_sha || github.sha }}
-      UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+      UPSTREAM_REPO: ${{ inputs.upstream_repo || github.repository }}
       UPSTREAM_PR: ${{ inputs.upstream_pr }}
       UPSTREAM_SHA: ${{ inputs.upstream_sha }}
-      U12: cisco@192.0.2.39
-      SSH_KEY: /home/cisco/.ssh/argo_to_u12
-      NS: cvk-system
-      REL: cvk
+      PATH: /home/cisco/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     steps:
       - name: Post pending status to upstream PR
@@ -58,10 +47,9 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_STATUS_TOKEN }}
-          PATH: /home/cisco/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::warning::UPSTREAM_STATUS_TOKEN secret missing; skipping status post"
+            echo "::warning::UPSTREAM_STATUS_TOKEN missing; skipping status"
             exit 0
           fi
           gh api -X POST "repos/${UPSTREAM_REPO}/statuses/${UPSTREAM_SHA}" \
@@ -70,246 +58,44 @@ jobs:
             -f description="Lab CI Cat9k running" \
             -f context="lab-ci / cat9k" >/dev/null
 
-      - name: Checkout (merge_group / non-dispatch)
-        if: inputs.upstream_sha == ''
-        uses: actions/checkout@v4
-        with: { fetch-depth: 1 }
-
-      - name: Checkout upstream commit (dispatch)
-        if: inputs.upstream_sha != '' && inputs.upstream_repo != ''
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.upstream_repo }}
-          ref: ${{ inputs.upstream_sha }}
-          fetch-depth: 1
-
-      - name: Stage source onto ubuntu12
+      - name: Submit WorkflowTemplate and wait
+        id: argo
         run: |
           set -euo pipefail
-          TAG="mq-${SHA:0:12}"
-          CR_NAME="cat9k-mq-${SHA:0:12}"
-          POD_NAME="lab-ci-mq-${SHA:0:12}"
-          echo "TAG=$TAG"           >> "$GITHUB_ENV"
-          echo "CR_NAME=$CR_NAME"   >> "$GITHUB_ENV"
-          echo "POD_NAME=$POD_NAME" >> "$GITHUB_ENV"
-          git ls-files -z | tar --null -cf - -T - \
-            | ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$U12" \
-                "rm -rf ~/cvk-mq && mkdir ~/cvk-mq && tar -xf - -C ~/cvk-mq"
+          NAME=$(argo submit -n virtual-kubelet-ci \
+            --from WorkflowTemplate/cat9k-pr-test \
+            -p upstream_repo="${UPSTREAM_REPO}" \
+            -p upstream_sha="${SHA}" \
+            -p upstream_pr="${UPSTREAM_PR:-local}" \
+            --generate-name "cat9k-${SHA:0:8}-" \
+            -o name | sed 's|^workflow.argoproj.io/||')
+          echo "workflow=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Submitted: $NAME"
+          argo watch -n virtual-kubelet-ci "$NAME"
+          PHASE=$(argo get -n virtual-kubelet-ci "$NAME" -o json | jq -r '.status.phase')
+          echo "phase=$PHASE" >> "$GITHUB_OUTPUT"
+          [ "$PHASE" = "Succeeded" ]
 
-      - name: Build + push CVK image to local registry
+      - name: Capture workflow logs on failure
+        if: failure() && steps.argo.outputs.workflow != ''
+        continue-on-error: true
         run: |
-          ssh -i "$SSH_KEY" "$U12" "
-            set -euo pipefail
-            cd ~/cvk-mq
-            docker build -t localhost:5000/cisco-vk:${TAG} .
-            docker push localhost:5000/cisco-vk:${TAG}
-          "
-
-      - name: Helm upgrade --install CVK
-        run: |
-          ssh -i "$SSH_KEY" "$U12" "
-            set -euo pipefail
-            cd ~/cvk-mq
-            helm upgrade --install ${REL} ./charts/cisco-virtual-kubelet \
-              --namespace ${NS} --create-namespace \
-              --set image.repository=localhost:5000/cisco-vk \
-              --set image.tag=${TAG} \
-              --set image.pullPolicy=IfNotPresent \
-              --wait --timeout 3m
-            kubectl -n ${NS} rollout status \
-              deploy/${REL}-cisco-virtual-kubelet-controller --timeout=2m
-          "
-
-      - name: Clean any stale app-hosting state on Cat9k
-        run: |
-          ssh -i "$SSH_KEY" "$U12" "bash -s" <<'REMOTE'
-          set -eu
-          curl -k -sS -u AI_AGENT_RW:cisco \
-            "https://198.51.100.102/restconf/data/Cisco-IOS-XE-app-hosting-oper:app-hosting-oper-data/apps" \
-            -H "Accept: application/yang-data+json" \
-            | python3 -c '
-          import json,sys,subprocess
-          d=json.load(sys.stdin)
-          key=next((k for k in d if "apps" in k),None)
-          apps=(d.get(key,{}).get("app",[]) if key else [])
-          for a in apps:
-              name=a.get("name","")
-              if name.startswith("cvk0000_"):
-                  for op in ("stop","deactivate","uninstall"):
-                      subprocess.run(
-                        ["curl","-k","-sS","-u","AI_AGENT_RW:cisco","-X","POST",
-                         "https://198.51.100.102/restconf/operations/Cisco-IOS-XE-rpc:app-hosting",
-                         "-H","Content-Type: application/yang-data+json",
-                         "-H","Accept: application/yang-data+json",
-                         "-d", json.dumps({"Cisco-IOS-XE-rpc:input":{op:{"appid":name}}})],
-                        check=False)
-          '
-          REMOTE
-
-      - name: Wait for Cat9k to quiesce (no cvk0000_* apps)
-        run: |
-          ssh -i "$SSH_KEY" "$U12" "bash -s" <<'REMOTE'
-          set -eu
-          for i in $(seq 1 24); do
-            COUNT=$(curl -k -sS -u AI_AGENT_RW:cisco \
-              "https://198.51.100.102/restconf/data/Cisco-IOS-XE-app-hosting-oper:app-hosting-oper-data/apps" \
-              -H "Accept: application/yang-data+json" \
-              | python3 -c 'import json,sys
-          d=json.load(sys.stdin)
-          k=next((k for k in d if "apps" in k), None)
-          a = d.get(k, {}).get("app", []) if k else []
-          print(sum(1 for x in a if x.get("name", "").startswith("cvk0000_")))')
-            echo "iter $i: cvk0000_* apps remaining: $COUNT"
-            [ "$COUNT" = "0" ] && exit 0
-            sleep 5
-          done
-          echo "WARNING: device still has cvk0000_* apps after 2m — proceeding anyway"
-          REMOTE
-
-      - name: Apply CiscoDevice + hello-app Pod, wait for Running
-        run: |
-          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
-          set -euo pipefail
-          kubectl apply -n ${NS} -f - <<'YAML'
-          apiVersion: cisco.vk/v1alpha1
-          kind: CiscoDevice
-          metadata:
-            name: ${CR_NAME}
-            namespace: ${NS}
-          spec:
-            driver: XE
-            address: "198.51.100.102"
-            port: 443
-            username: AI_AGENT_RW
-            password: cisco
-            tls: { enabled: true, insecureSkipVerify: true }
-            xe:
-              networking:
-                interface:
-                  type: AppGigabitEthernet
-                  appGigabitEthernet:
-                    mode: access
-                    dhcp: true
-                    guestInterface: 0
-          YAML
-
-          for i in \$(seq 1 30); do
-            kubectl get node ${CR_NAME} >/dev/null 2>&1 && \
-            [ "\$(kubectl get node ${CR_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ] && break
-            sleep 5
-          done
-          kubectl get node ${CR_NAME}
-
-          kubectl apply -n default -f - <<'YAML'
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: ${POD_NAME}
-            namespace: default
-          spec:
-            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
-            tolerations:
-            - key: virtual-kubelet.io/provider
-              operator: Exists
-            - key: node.kubernetes.io/not-ready
-              operator: Exists
-            - key: node.kubernetes.io/unreachable
-              operator: Exists
-            containers:
-            - name: hello
-              image: flash:/hello-app.iosxe.tar
-          YAML
-
-          kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=15m
-          kubectl -n default get pod ${POD_NAME} -o wide
-          REMOTE
-
-      - name: Restart CVK controller and verify Pod survives
-        run: |
-          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
-          set -euo pipefail
-          echo "--- pod before restart:"
-          kubectl -n default get pod ${POD_NAME} -o jsonpath='{.status.phase} {.status.startTime}{"\n"}'
-          POD_UID_BEFORE=\$(kubectl -n default get pod ${POD_NAME} -o jsonpath='{.metadata.uid}')
-
-          kubectl -n ${NS} rollout restart deploy/${REL}-cisco-virtual-kubelet-controller
-          kubectl -n ${NS} rollout status deploy/${REL}-cisco-virtual-kubelet-controller --timeout=3m
-          sleep 15
-
-          echo "--- pod after restart:"
-          kubectl -n default get pod ${POD_NAME} -o jsonpath='{.status.phase} {.status.startTime}{"\n"}'
-          POD_UID_AFTER=\$(kubectl -n default get pod ${POD_NAME} -o jsonpath='{.metadata.uid}')
-
-          if [ "\$POD_UID_BEFORE" != "\$POD_UID_AFTER" ]; then
-            echo "ERROR: Pod UID changed across controller restart (\$POD_UID_BEFORE vs \$POD_UID_AFTER)" >&2
-            exit 1
-          fi
-          kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=2m
-          REMOTE
-
-      # Stress scenarios (Multi-container + Concurrent Pods) live
-      # only on Cat8kv. Cat9k physical install times are variable
-      # and approach/exceed the wait windows; validating the same
-      # CVK logic there doesn't add signal over Cat8kv. Cat9k's
-      # value is integration on real hardware: primary Pod +
-      # controller-restart resilience cover that.
-
-      - name: Teardown (always)
-        if: always()
-        env:
-          SSH_OPTS: "-i /home/cisco/.ssh/argo_to_u12 -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
-        run: |
-          run_ssh() {
-            local seconds=$1; shift
-            timeout "$seconds" ssh $SSH_OPTS "$U12" "$@" \
-              || echo "  ! step exited non-zero or timed out after ${seconds}s"
-          }
-
-          echo "teardown: deleting test Pod"
-          run_ssh 30 "kubectl -n default delete pod ${POD_NAME} --ignore-not-found --wait=false"
-
-          echo "teardown: deleting scenario Pods (multi-container / concurrent)"
-          run_ssh 30 "kubectl -n default delete pod -l labci-scenario --ignore-not-found --wait=false"
-
-          echo "teardown: deleting CiscoDevice"
-          run_ssh 30 "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false"
-
-          echo "teardown: removing source tree"
-          run_ssh 15 "rm -rf ~/cvk-mq"
-
-          echo "teardown: pruning dangling docker layers on ubuntu12"
-          # k3s now pulls from the local registry; no containerd
-          # tag-level cleanup needed. docker still caches build layers.
-          run_ssh 60 "docker image prune -f >/dev/null 2>&1 || true"
-
-          echo "teardown: done"
-
-      - name: Collect diagnostics on failure
-        if: failure()
-        run: |
-          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE > diagnostics.txt 2>&1 || true
-          kubectl get nodes -o wide
-          kubectl get pods -A
-          kubectl get ciscodevices -A
-          kubectl -n ${NS} describe deploy ${REL}-cisco-virtual-kubelet-controller || true
-          kubectl -n ${NS} logs deploy/${REL}-cisco-virtual-kubelet-controller --tail=200 || true
-          kubectl -n default describe pod ${POD_NAME} || true
-          REMOTE
+          argo logs -n virtual-kubelet-ci "${{ steps.argo.outputs.workflow }}" > argo-logs.txt 2>&1 || true
+          head -200 argo-logs.txt
       - uses: actions/upload-artifact@v4
-        if: failure()
+        if: failure() && steps.argo.outputs.workflow != ''
         with:
-          name: diagnostics-cat9k
-          path: diagnostics.txt
+          name: argo-logs-cat9k
+          path: argo-logs.txt
 
       - name: Post final status to upstream PR
         if: always() && inputs.upstream_sha != '' && inputs.upstream_repo != ''
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_STATUS_TOKEN }}
-          PATH: /home/cisco/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::warning::UPSTREAM_STATUS_TOKEN secret missing; skipping status post"
+            echo "::warning::UPSTREAM_STATUS_TOKEN missing; skipping status"
             exit 0
           fi
           case "${{ job.status }}" in
