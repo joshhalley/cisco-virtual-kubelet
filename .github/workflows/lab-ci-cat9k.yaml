@@ -91,14 +91,13 @@ jobs:
             | ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$U12" \
                 "rm -rf ~/cvk-mq && mkdir ~/cvk-mq && tar -xf - -C ~/cvk-mq"
 
-      - name: Build CVK image
+      - name: Build + push CVK image to local registry
         run: |
           ssh -i "$SSH_KEY" "$U12" "
+            set -euo pipefail
             cd ~/cvk-mq
-            docker build -t cisco-vk:${TAG} .
-            docker save cisco-vk:${TAG} -o /tmp/cvk-${TAG}.tar
-            sudo k3s ctr images import /tmp/cvk-${TAG}.tar
-            rm -f /tmp/cvk-${TAG}.tar
+            docker build -t localhost:5000/cisco-vk:${TAG} .
+            docker push localhost:5000/cisco-vk:${TAG}
           "
 
       - name: Helm upgrade --install CVK
@@ -108,9 +107,9 @@ jobs:
             cd ~/cvk-mq
             helm upgrade --install ${REL} ./charts/cisco-virtual-kubelet \
               --namespace ${NS} --create-namespace \
-              --set image.repository=cisco-vk \
+              --set image.repository=localhost:5000/cisco-vk \
               --set image.tag=${TAG} \
-              --set image.pullPolicy=Never \
+              --set image.pullPolicy=IfNotPresent \
               --wait --timeout 3m
             kubectl -n ${NS} rollout status \
               deploy/${REL}-cisco-virtual-kubelet-controller --timeout=2m
@@ -217,18 +216,12 @@ jobs:
           echo "teardown: deleting CiscoDevice"
           run_ssh 30 "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false"
 
-          echo "teardown: GC'ing old pr-/mq- images (keep current ${TAG})"
-          run_ssh 120 "
-            CURRENT=docker.io/library/cisco-vk:${TAG}
-            sudo k3s ctr images ls -q | \
-              awk -v cur=\"\$CURRENT\" '/docker.io\\/library\\/cisco-vk:(pr|mq)-/ && \$0 != cur' | \
-              xargs -r -n1 sudo k3s ctr images rm
-          "
-
           echo "teardown: removing source tree"
           run_ssh 15 "rm -rf ~/cvk-mq"
 
           echo "teardown: pruning dangling docker layers on ubuntu12"
+          # k3s now pulls from the local registry; no containerd
+          # tag-level cleanup needed. docker still caches build layers.
           run_ssh 60 "docker image prune -f >/dev/null 2>&1 || true"
 
           echo "teardown: done"

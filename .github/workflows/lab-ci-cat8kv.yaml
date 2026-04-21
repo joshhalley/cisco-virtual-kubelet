@@ -105,15 +105,18 @@ jobs:
             | ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$U12" \
                 "rm -rf ~/cvk-pr && mkdir ~/cvk-pr && tar -xf - -C ~/cvk-pr"
 
-      - name: Build CVK image on ubuntu12
+      - name: Build + push CVK image to local registry on ubuntu12
         run: |
+          # Local Docker registry runs at 127.0.0.1:5000 on ubuntu12
+          # (persistent container + restart=unless-stopped). k3s is
+          # configured via /etc/rancher/k3s/registries.yaml to pull
+          # from it without TLS. This replaces the save/import dance
+          # and lets containerd share layers across PR images.
           ssh -i "$SSH_KEY" "$U12" "
             set -euo pipefail
             cd ~/cvk-pr
-            docker build -t cisco-vk:${TAG} .
-            docker save cisco-vk:${TAG} -o /tmp/cvk-${TAG}.tar
-            sudo k3s ctr images import /tmp/cvk-${TAG}.tar
-            rm -f /tmp/cvk-${TAG}.tar
+            docker build -t localhost:5000/cisco-vk:${TAG} .
+            docker push localhost:5000/cisco-vk:${TAG}
           "
 
       - name: Helm upgrade --install CVK with PR image
@@ -123,9 +126,9 @@ jobs:
             cd ~/cvk-pr
             helm upgrade --install ${REL} ./charts/cisco-virtual-kubelet \
               --namespace ${NS} --create-namespace \
-              --set image.repository=cisco-vk \
+              --set image.repository=localhost:5000/cisco-vk \
               --set image.tag=${TAG} \
-              --set image.pullPolicy=Never \
+              --set image.pullPolicy=IfNotPresent \
               --wait --timeout 3m
             kubectl -n ${NS} rollout status \
               deploy/${REL}-cisco-virtual-kubelet-controller --timeout=2m
@@ -244,18 +247,14 @@ jobs:
           echo "teardown: deleting CiscoDevice (controller cascade cleans up VK Node + Deployment)"
           run_ssh 30 "kubectl -n ${NS} delete ciscodevice ${CR_NAME} --ignore-not-found --wait=false"
 
-          echo "teardown: GC'ing old pr-* images (keep current ${TAG})"
-          run_ssh 120 "
-            CURRENT=docker.io/library/cisco-vk:${TAG}
-            sudo k3s ctr images ls -q | \
-              awk -v cur=\"\$CURRENT\" '/docker.io\\/library\\/cisco-vk:pr-/ && \$0 != cur' | \
-              xargs -r -n1 sudo k3s ctr images rm
-          "
-
           echo "teardown: removing source tree"
           run_ssh 15 "rm -rf ~/cvk-pr"
 
           echo "teardown: pruning dangling docker layers on ubuntu12"
+          # GC of tagged pr-*/mq-* images in containerd is no longer
+          # needed — k3s now pulls from the local registry and
+          # containerd GC's blobs automatically. docker still caches
+          # build layers, so prune to keep disk under control.
           run_ssh 60 "docker image prune -f >/dev/null 2>&1 || true"
 
           echo "teardown: done"
