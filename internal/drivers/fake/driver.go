@@ -124,21 +124,46 @@ func (d *FAKEDriver) DeployPod(ctx context.Context, pod *v1.Pod) error {
 	return nil
 }
 
+// UpdatePod replaces the stored pod matching the given pod's
+// (namespace, name). Returns an error if no such pod exists so the
+// caller can distinguish update-of-existing from blind insert.
 func (d *FAKEDriver) UpdatePod(ctx context.Context, pod *v1.Pod) error {
-	// TODO
-	log.G(ctx).Info("Pod UpdateContainer request received")
-	return nil
+	log.G(ctx).WithFields(log.Fields{
+		"namespace": pod.Namespace,
+		"pod":       pod.Name,
+	}).Info("Pod UpdatePod request received")
+
+	for i := range d.pods {
+		if d.pods[i].Namespace == pod.Namespace && d.pods[i].Name == pod.Name {
+			// Preserve status fields (the fake sets these at DeployPod
+			// time); only overwrite spec-derived fields.
+			updated := *pod
+			updated.Status = d.pods[i].Status
+			d.pods[i] = updated
+			return nil
+		}
+	}
+	return fmt.Errorf("pod not found for update: %s/%s", pod.Namespace, pod.Name)
 }
 
+// DeletePod removes the stored pod matching (namespace, name). Not
+// finding the pod is not an error (idempotent delete).
 func (d *FAKEDriver) DeletePod(ctx context.Context, pod *v1.Pod) error {
 	log.G(ctx).WithFields(log.Fields{
-		"pod": pod.Name,
+		"namespace": pod.Namespace,
+		"pod":       pod.Name,
 	}).Info("Pod DeletePod request received")
+
+	for i := range d.pods {
+		if d.pods[i].Namespace == pod.Namespace && d.pods[i].Name == pod.Name {
+			d.pods = append(d.pods[:i], d.pods[i+1:]...)
+			return nil
+		}
+	}
 	return nil
 }
 
 func (d *FAKEDriver) GetPodStatus(ctx context.Context, pod *v1.Pod) (*v1.Pod, error) {
-	// TODO
 	log.G(ctx).WithFields(log.Fields{
 		"namespace": pod.Namespace,
 		"pod":       pod.Name,
@@ -152,10 +177,17 @@ func (d *FAKEDriver) GetPodStatus(ctx context.Context, pod *v1.Pod) (*v1.Pod, er
 	return nil, fmt.Errorf("could not find pod: %s, %s", pod.Namespace, pod.Name)
 }
 
+// ListPods returns copies of all stored pods. Returns a non-nil
+// empty slice when no pods are stored (callers can range over the
+// result without nil-checking).
 func (d *FAKEDriver) ListPods(ctx context.Context) ([]*v1.Pod, error) {
-	// TODO
-	log.G(ctx).Info("Pod ListContainers request received")
-	return nil, nil
+	log.G(ctx).Info("Pod ListPods request received")
+	out := make([]*v1.Pod, 0, len(d.pods))
+	for i := range d.pods {
+		p := d.pods[i]
+		out = append(out, &p)
+	}
+	return out, nil
 }
 
 func (d *FAKEDriver) GetGlobalOperationalData(ctx context.Context) (*common.AppHostingOperData, error) {
