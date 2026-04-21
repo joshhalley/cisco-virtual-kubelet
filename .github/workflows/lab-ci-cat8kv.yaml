@@ -66,6 +66,10 @@ jobs:
         continue-on-error: true  # don't abort the test if the secret isn't set
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_STATUS_TOKEN }}
+          # gh on self-hosted runner lives in ~cisco/bin (installed
+          # user-space, not via package manager). Prepend explicitly
+          # so the step works on both GH-hosted and self-hosted runners.
+          PATH: /home/cisco/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::UPSTREAM_STATUS_TOKEN secret missing; skipping status post"
@@ -281,6 +285,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_STATUS_TOKEN }}
+          PATH: /home/cisco/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::UPSTREAM_STATUS_TOKEN secret missing; skipping status post"
