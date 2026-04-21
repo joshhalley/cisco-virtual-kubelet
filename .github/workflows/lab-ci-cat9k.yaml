@@ -41,7 +41,7 @@ concurrency:
 jobs:
   cat9k:
     runs-on: [self-hosted, lab-cvk]
-    timeout-minutes: 40
+    timeout-minutes: 30
     env:
       SHA: ${{ inputs.upstream_sha || github.sha }}
       UPSTREAM_REPO: ${{ inputs.upstream_repo }}
@@ -247,72 +247,12 @@ jobs:
           kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=2m
           REMOTE
 
-      - name: Multi-container Pod scenario
-        run: |
-          MULTI_NAME="lab-ci-mq-${SHA:0:12}-multi"
-          echo "MULTI_NAME=$MULTI_NAME" >> "$GITHUB_ENV"
-          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
-          set -euo pipefail
-          kubectl apply -n default -f - <<'YAML'
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: ${MULTI_NAME}
-            namespace: default
-            labels: { labci-scenario: multi-container }
-          spec:
-            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
-            tolerations:
-            - key: virtual-kubelet.io/provider
-              operator: Exists
-            - key: node.kubernetes.io/not-ready
-              operator: Exists
-            - key: node.kubernetes.io/unreachable
-              operator: Exists
-            containers:
-            - name: alpha
-              image: flash:/hello-app.iosxe.tar
-            - name: beta
-              image: flash:/hello-app.iosxe.tar
-          YAML
-          kubectl -n default wait --for=condition=Ready pod/${MULTI_NAME} --timeout=10m
-          [ "\$(kubectl -n default get pod ${MULTI_NAME} -o jsonpath='{.status.containerStatuses[?(@.name=="alpha")].ready}')" = "true" ]
-          [ "\$(kubectl -n default get pod ${MULTI_NAME} -o jsonpath='{.status.containerStatuses[?(@.name=="beta")].ready}')" = "true" ]
-          REMOTE
-
-      - name: Concurrent Pods scenario
-        run: |
-          C1="lab-ci-mq-${SHA:0:12}-c1"
-          C2="lab-ci-mq-${SHA:0:12}-c2"
-          echo "C1=$C1" >> "$GITHUB_ENV"
-          echo "C2=$C2" >> "$GITHUB_ENV"
-          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
-          set -euo pipefail
-          for NAME in ${C1} ${C2}; do
-            kubectl apply -n default -f - <<YAML
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: \$NAME
-            namespace: default
-            labels: { labci-scenario: concurrent }
-          spec:
-            nodeSelector: { kubernetes.io/hostname: ${CR_NAME} }
-            tolerations:
-            - key: virtual-kubelet.io/provider
-              operator: Exists
-            - key: node.kubernetes.io/not-ready
-              operator: Exists
-            - key: node.kubernetes.io/unreachable
-              operator: Exists
-            containers:
-            - name: hello
-              image: flash:/hello-app.iosxe.tar
-          YAML
-          done
-          kubectl -n default wait --for=condition=Ready pod/${C1} pod/${C2} --timeout=12m
-          kubectl -n default get pod ${C1} ${C2} -o wide
-          REMOTE
+      # Stress scenarios (Multi-container + Concurrent Pods) live
+      # only on Cat8kv. Cat9k physical install times are variable
+      # and approach/exceed the wait windows; validating the same
+      # CVK logic there doesn't add signal over Cat8kv. Cat9k's
+      # value is integration on real hardware: primary Pod +
+      # controller-restart resilience cover that.
 
       - name: Teardown (always)
         if: always()

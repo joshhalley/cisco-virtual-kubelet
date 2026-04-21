@@ -324,6 +324,9 @@ jobs:
           echo "container readiness: \$READY"
           [ "\$(kubectl -n default get pod ${MULTI_NAME} -o jsonpath='{.status.containerStatuses[?(@.name=="alpha")].ready}')" = "true" ]
           [ "\$(kubectl -n default get pod ${MULTI_NAME} -o jsonpath='{.status.containerStatuses[?(@.name=="beta")].ready}')" = "true" ]
+          # Clean up so the next scenario starts from a known device
+          # state (cat9k observed to fail when 5 apps stack up).
+          kubectl -n default delete pod ${MULTI_NAME} --ignore-not-found --wait=false
           REMOTE
 
       - name: Concurrent Pods scenario
@@ -336,6 +339,10 @@ jobs:
           C2="lab-ci-${SHA:0:12}-c2"
           echo "C1=$C1" >> "$GITHUB_ENV"
           echo "C2=$C2" >> "$GITHUB_ENV"
+          # Multi-container's pod was deleted at the end of its step
+          # but the device's async uninstall takes a few seconds.
+          # Give it a brief settle window before stacking new apps.
+          sleep 30
           ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
           set -euo pipefail
           for NAME in ${C1} ${C2}; do
@@ -362,6 +369,7 @@ jobs:
           done
           kubectl -n default wait --for=condition=Ready pod/${C1} pod/${C2} --timeout=10m
           kubectl -n default get pod ${C1} ${C2} -o wide
+          kubectl -n default delete pod ${C1} ${C2} --ignore-not-found --wait=false
           REMOTE
 
       - name: Teardown (always runs)
