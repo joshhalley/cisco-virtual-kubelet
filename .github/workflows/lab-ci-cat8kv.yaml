@@ -228,6 +228,37 @@ jobs:
           kubectl -n default get pod ${POD_NAME} -o wide
           REMOTE
 
+      - name: Restart CVK controller and verify Pod survives
+        run: |
+          # Regression guard for reconciler state after a controller
+          # crash/redeploy. The controller is restarted; its observed-
+          # state for the existing CiscoDevice and VK Deployment must
+          # be picked up without disrupting the running Pod on the
+          # VK Node.
+          ssh -i "$SSH_KEY" "$U12" "bash -s" <<REMOTE
+          set -euo pipefail
+          echo "--- pod before restart:"
+          kubectl -n default get pod ${POD_NAME} -o jsonpath='{.status.phase} {.status.startTime}{"\n"}'
+          POD_UID_BEFORE=\$(kubectl -n default get pod ${POD_NAME} -o jsonpath='{.metadata.uid}')
+
+          kubectl -n ${NS} rollout restart deploy/${REL}-cisco-virtual-kubelet-controller
+          kubectl -n ${NS} rollout status deploy/${REL}-cisco-virtual-kubelet-controller --timeout=3m
+
+          # Give the reconciler one full cycle to pick up state.
+          sleep 15
+
+          echo "--- pod after restart:"
+          kubectl -n default get pod ${POD_NAME} -o jsonpath='{.status.phase} {.status.startTime}{"\n"}'
+          POD_UID_AFTER=\$(kubectl -n default get pod ${POD_NAME} -o jsonpath='{.metadata.uid}')
+
+          # The same Pod must still be Ready (no recreation, no flapping).
+          if [ "\$POD_UID_BEFORE" != "\$POD_UID_AFTER" ]; then
+            echo "ERROR: Pod UID changed across controller restart (\$POD_UID_BEFORE vs \$POD_UID_AFTER)" >&2
+            exit 1
+          fi
+          kubectl -n default wait --for=condition=Ready pod/${POD_NAME} --timeout=2m
+          REMOTE
+
       - name: Teardown (always runs)
         if: always()
         env:
