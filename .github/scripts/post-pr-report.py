@@ -108,6 +108,22 @@ def fetch_steps(fork_repo: str, run_id: int) -> list[dict]:
     return jobs[0].get("steps", [])
 
 
+def fetch_run_duration(fork_repo: str, run_id: int) -> str:
+    """Format a workflow run's wall-clock duration.
+
+    The commit-status's created_at/updated_at are both stamped at the moment
+    the status is posted (single API call at workflow completion), so they
+    can't be subtracted to get a meaningful duration. The actual run
+    timing lives on the workflow run object as run_started_at → updated_at.
+    """
+    try:
+        run = api(f"/repos/{fork_repo}/actions/runs/{run_id}") or {}
+    except urllib.error.HTTPError as e:
+        warn(f"fetch run {run_id}: {e}")
+        return ""
+    return fmt_duration(run.get("run_started_at"), run.get("updated_at"))
+
+
 def render_report(
     upstream_repo: str,
     upstream_sha: str,
@@ -145,8 +161,9 @@ def render_report(
                 total_fail += 1
             else:
                 total_pending += 1
-            duration = fmt_duration(s.get("created_at"), s.get("updated_at"))
             tgt = s.get("target_url") or ""
+            run_id = run_id_from_target_url(tgt)
+            duration = fetch_run_duration(fork_repo, run_id) if run_id else ""
             link = f"[logs]({tgt})" if tgt else "—"
         verdict_emoji = STATE_EMOJI.get(state, "❔")
         lines.append(f"| {emoji} {label} | {verdict_emoji} `{state}` | {duration or '—'} | {link} |")
