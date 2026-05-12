@@ -50,6 +50,13 @@ jobs:
       PATH: /home/cisco/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     steps:
+      # Refresh the workspace so .github/scripts/post-pr-report.py and any
+      # other workflow-side tooling reflects the current ref. Without this
+      # the self-hosted runner reuses whatever was checked out on a previous
+      # run, which silently masks fixes to the workflow's own scripts.
+      - name: Checkout workflow tree
+        uses: actions/checkout@v4
+
       - name: Post pending status to upstream PR
         if: inputs.upstream_sha != '' && inputs.upstream_repo != ''
         continue-on-error: true
