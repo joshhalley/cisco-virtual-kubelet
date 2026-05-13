@@ -83,13 +83,33 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go test (race, coverage)
-        run: go test -race -coverprofile=coverage.out ./...
+      - name: Install gotestsum
+        # gotestsum wraps `go test` and produces a JSON event stream
+        # plus JUnit XML. post-pr-report.py reads the JSON file from
+        # the artefact below to group test counts by Go package (and
+        # in turn by CRD) on the upstream PR comment.
+        run: go install gotest.tools/gotestsum@v1.12.0
+
+      - name: go test (race, coverage, json events)
+        # gotestsum exits with the same status as the underlying
+        # `go test` invocation, so this step still gates the check.
+        # The -- separates gotestsum's own flags from go test's.
+        run: |
+          gotestsum \
+            --jsonfile=test-output.json \
+            --junitfile=test-output.xml \
+            --format=pkgname \
+            -- -race -coverprofile=coverage.out ./...
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: coverage
-          path: coverage.out
+          name: unit-test-results
+          path: |
+            coverage.out
+            test-output.json
+            test-output.xml
+          if-no-files-found: warn
 
       - name: Post final status to upstream PR
         if: always() && inputs.upstream_sha != '' && inputs.upstream_repo != ''

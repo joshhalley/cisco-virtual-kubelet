@@ -22,12 +22,14 @@ reporting hiccup never fails the main CI check. Writes a one-line
 warning to stderr in those cases.
 """
 
+import io
 import json
 import os
 import re
 import sys
 import urllib.error
 import urllib.request
+import zipfile
 from typing import Any
 
 # Contexts we care about. Order = display order in the report table.
@@ -45,6 +47,74 @@ STATE_EMOJI = {
 }
 
 GITHUB_API = "https://api.github.com"
+
+# Go package path → CRD identifier. Used to bucket gotestsum output
+# into the per-CRD table on the upstream PR comment.
+#
+# Edit this list when a new CRD or a new test package lands; missing
+# packages fall through to the "Other / shared code" bucket so they're
+# still counted but don't pollute the per-CRD breakdown.
+PACKAGE_TO_CRD: dict[str, str] = {
+    # CRDs implemented by their own controller package
+    "github.com/cisco/virtual-kubelet-cisco/internal/controller":                              "CiscoDevice",
+    "github.com/cisco/virtual-kubelet-cisco/internal/aggregator":                              "CiscoDevice",
+    "github.com/cisco/virtual-kubelet-cisco/internal/provider":                                "CiscoDevice",
+    "github.com/cisco/virtual-kubelet-cisco/internal/provider/deviceoperation":                "DeviceOperation",
+    "github.com/cisco/virtual-kubelet-cisco/internal/provider/diagnostic":                     "IOSXEDiagnostic",
+    "github.com/cisco/virtual-kubelet-cisco/internal/provider/diagnostic/adminserver":         "IOSXEDiagnostic",
+    "github.com/cisco/virtual-kubelet-cisco/internal/provider/softwareupgrade":                "IOSXESoftwareUpgrade",
+    "github.com/cisco/virtual-kubelet-cisco/internal/provider/operationalaction":              "IOSXEOperationalAction",
+    # Driver / transport packages — bucket against the CRD whose
+    # reconciler exercises them most. Operators viewing the report
+    # want CRD-level signal, not "transport-X passes".
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers":                                  "CiscoDevice",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/common":                          "CiscoDevice",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe":                           "CiscoDevice",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/configdriver":              "IOSXEConfig",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/configdriver/engine":       "IOSXEConfig",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/configdriver/intent":       "IOSXEConfig",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/configdriver/schema":       "IOSXEConfig",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/configdriver/transport":    "IOSXEConfig",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/configdriver/writers":      "IOSXEConfig",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/telemetry":                 "IOSXETelemetry",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/devicegrpc":                "(shared) gRPC pool",
+    "github.com/cisco/virtual-kubelet-cisco/internal/drivers/iosxe/gnoi":                      "(shared) gNOI client",
+    # Telemetry / mapper packages — pre-PR shape.
+    "github.com/cisco/virtual-kubelet-cisco/internal/telemetry/classifier":                    "IOSXETelemetry",
+    "github.com/cisco/virtual-kubelet-cisco/internal/telemetry/correlation":                   "IOSXETelemetry",
+    "github.com/cisco/virtual-kubelet-cisco/internal/telemetry/emit":                          "IOSXETelemetry",
+    "github.com/cisco/virtual-kubelet-cisco/internal/telemetry/mapper":                        "IOSXETelemetry",
+    "github.com/cisco/virtual-kubelet-cisco/internal/telemetry/state":                         "IOSXETelemetry",
+    "github.com/cisco/virtual-kubelet-cisco/internal/telemetry/yang":                          "IOSXETelemetry",
+}
+
+# Stable display order for the per-CRD table.
+CRD_ORDER = [
+    "CiscoDevice",
+    "IOSXEConfig",
+    "IOSXEConfigBundle",
+    "IOSXEConfigDefaults",
+    "IOSXEConfigRevision",
+    "IOSXEConfigApplyLog",
+    "IOSXEDiagnostic",
+    "IOSXETelemetry",
+    "IOSXEDeviceGroupConfig",
+    "IOSXEInterfaceGroupConfig",
+    "IOSXETemplate",
+    "DeviceOperation",
+    "IOSXESoftwareUpgrade",
+    "IOSXEOperationalAction",
+    "(shared) gRPC pool",
+    "(shared) gNOI client",
+    "Other",
+]
+
+# Single-line marker the lab Argo scenarios emit. See
+# cvk-gitops/environments/lab/cvk-cicd/cat{8kv,9k}-pr-test-template.yaml.
+SCENARIO_MARKER_RE = re.compile(
+    r"::cvk-scenario:: crd=(?P<crd>\S+) name=(?P<name>\S+) phase=(?P<phase>\S+)"
+    r"(?:\s+duration=(?P<duration>\d+))?"
+)
 
 
 def warn(msg: str) -> None:
@@ -106,6 +176,202 @@ def fetch_steps(fork_repo: str, run_id: int) -> list[dict]:
     if not jobs:
         return []
     return jobs[0].get("steps", [])
+
+
+def http_get_bytes(url: str) -> bytes | None:
+    """Authenticated GET returning raw response body. None on any error."""
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read()
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        warn(f"http_get_bytes {url}: {e}")
+        return None
+
+
+def fetch_job_log_text(fork_repo: str, run_id: int) -> str:
+    """Concatenated stdout of every job in the run.
+
+    Used to grep ::cvk-scenario:: markers out of the Argo workflow
+    output without depending on the artefact upload step (which the
+    lab-ci workflows only do on failure today).
+    """
+    try:
+        data = api(f"/repos/{fork_repo}/actions/runs/{run_id}/jobs") or {}
+    except urllib.error.HTTPError as e:
+        warn(f"fetch jobs {run_id}: {e}")
+        return ""
+    pieces: list[str] = []
+    for job in data.get("jobs", []):
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        body = http_get_bytes(f"{GITHUB_API}/repos/{fork_repo}/actions/jobs/{job_id}/logs")
+        if body:
+            pieces.append(body.decode("utf-8", errors="replace"))
+    return "\n".join(pieces)
+
+
+def fetch_artefact_file(fork_repo: str, run_id: int, artefact_name: str, file_in_zip: str) -> bytes | None:
+    """Download a single file out of a named workflow artefact zip.
+
+    The GitHub artefacts API returns a redirect to a temporary signed
+    URL; urllib follows it automatically when authenticated. Returns
+    None on any failure — the report degrades gracefully.
+    """
+    try:
+        listing = api(f"/repos/{fork_repo}/actions/runs/{run_id}/artifacts") or {}
+    except urllib.error.HTTPError as e:
+        warn(f"list artefacts {run_id}: {e}")
+        return None
+    for art in listing.get("artifacts", []):
+        if art.get("name") != artefact_name:
+            continue
+        zip_bytes = http_get_bytes(art.get("archive_download_url", ""))
+        if not zip_bytes:
+            return None
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+                with z.open(file_in_zip) as f:
+                    return f.read()
+        except (zipfile.BadZipFile, KeyError) as e:
+            warn(f"artefact {artefact_name} missing {file_in_zip}: {e}")
+            return None
+    return None
+
+
+def parse_gotestsum_json(content: bytes) -> dict[str, dict[str, int]]:
+    """Parse gotestsum's JSON event stream into per-package counts.
+
+    Each line is one event with Action ∈ {run,pass,fail,skip,output,...}.
+    We use the package-level summary events (Test field absent / empty)
+    to derive {package: {pass, fail, skip, total}}. Falls back to
+    counting individual test events when no package summary appears.
+    """
+    stats: dict[str, dict[str, int]] = {}
+    by_test: dict[tuple[str, str], str] = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or not line.startswith(b"{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        pkg = ev.get("Package", "")
+        action = ev.get("Action", "")
+        test = ev.get("Test", "")
+        if not pkg:
+            continue
+        if test:
+            if action in ("pass", "fail", "skip"):
+                by_test[(pkg, test)] = action
+        else:
+            # Package summary
+            if action in ("pass", "fail", "skip"):
+                stats.setdefault(pkg, {"pass": 0, "fail": 0, "skip": 0})
+                # Aggregate from individual test events for the count;
+                # the package-summary's Action alone tells us the
+                # pass/fail of the package, not the count of tests.
+    # Roll up per-test outcomes.
+    for (pkg, _test), outcome in by_test.items():
+        s = stats.setdefault(pkg, {"pass": 0, "fail": 0, "skip": 0})
+        s[outcome] = s.get(outcome, 0) + 1
+    return stats
+
+
+def parse_scenario_markers(text: str) -> dict[tuple[str, str], dict[str, Any]]:
+    """Extract the latest phase per (crd, scenario-name) tuple.
+
+    Each Argo scenario emits two markers (running + final). We keep
+    whichever is most recent in the log, so the end-of-run state wins.
+    """
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for m in SCENARIO_MARKER_RE.finditer(text):
+        key = (m.group("crd"), m.group("name"))
+        out[key] = {
+            "crd": m.group("crd"),
+            "name": m.group("name"),
+            "phase": m.group("phase"),
+            "duration": int(m.group("duration") or 0),
+        }
+    return out
+
+
+def crd_for_package(pkg: str) -> str:
+    """Bucket a Go package path into a CRD label, with longest-prefix match."""
+    best = ""
+    for candidate in PACKAGE_TO_CRD:
+        if pkg == candidate or pkg.startswith(candidate + "/"):
+            if len(candidate) > len(best):
+                best = candidate
+    return PACKAGE_TO_CRD.get(best, "Other") if best else "Other"
+
+
+def render_crd_coverage(
+    unit_stats: dict[str, dict[str, int]],
+    cat8kv_markers: dict[tuple[str, str], dict[str, Any]],
+    cat9k_markers: dict[tuple[str, str], dict[str, Any]],
+) -> list[str]:
+    """Produce the '### Coverage by CRD' section as a list of md lines."""
+    # Unit-test aggregation: package counts → CRD totals.
+    unit: dict[str, dict[str, int]] = {}
+    for pkg, c in unit_stats.items():
+        crd = crd_for_package(pkg)
+        u = unit.setdefault(crd, {"pass": 0, "fail": 0, "skip": 0})
+        u["pass"] += c.get("pass", 0)
+        u["fail"] += c.get("fail", 0)
+        u["skip"] += c.get("skip", 0)
+
+    # Scenario aggregation: count per (crd, source).
+    def bucket_scenarios(markers: dict[tuple[str, str], dict[str, Any]]) -> dict[str, dict[str, int]]:
+        b: dict[str, dict[str, int]] = {}
+        for v in markers.values():
+            crd = v["crd"]
+            phase = v["phase"]
+            s = b.setdefault(crd, {"pass": 0, "fail": 0})
+            if phase == "succeeded":
+                s["pass"] += 1
+            elif phase == "failed":
+                s["fail"] += 1
+            # phase=running implies the trap didn't fire → treat as failed
+            else:
+                s["fail"] += 1
+        return b
+
+    cat8kv = bucket_scenarios(cat8kv_markers)
+    cat9k = bucket_scenarios(cat9k_markers)
+
+    # Union of CRDs that appear in any bucket, ordered by CRD_ORDER.
+    seen = set(unit) | set(cat8kv) | set(cat9k)
+    ordered = [c for c in CRD_ORDER if c in seen] + sorted(seen - set(CRD_ORDER))
+
+    if not ordered:
+        return []  # nothing to render yet
+
+    lines: list[str] = []
+    lines.append("")
+    lines.append("### Coverage by CRD")
+    lines.append("")
+    lines.append("| CRD | Unit | Cat8kv | Cat9k |")
+    lines.append("| :--- | :---: | :---: | :---: |")
+    for crd in ordered:
+        u = unit.get(crd, {"pass": 0, "fail": 0, "skip": 0})
+        c8 = cat8kv.get(crd, {"pass": 0, "fail": 0})
+        c9 = cat9k.get(crd, {"pass": 0, "fail": 0})
+        def cell(c: dict[str, int]) -> str:
+            p, f = c.get("pass", 0), c.get("fail", 0)
+            tot = p + f
+            if tot == 0:
+                return "—"
+            mark = "✅" if f == 0 else "❌"
+            return f"{p}/{tot} {mark}"
+        lines.append(f"| `{crd}` | {cell(u)} | {cell(c8)} | {cell(c9)} |")
+    lines.append("")
+    return lines
 
 
 def fetch_run_duration(fork_repo: str, run_id: int) -> str:
@@ -177,7 +443,35 @@ def render_report(
     if total_pending:
         totals.append(f"**{total_pending} pending** ⏳")
     lines.append("**Summary:** " + " · ".join(totals) if totals else "**Summary:** no results yet")
-    lines.append("")
+
+    # CRD-coverage section. Each block degrades to "—" cells when its
+    # source data isn't available yet (e.g. unit-tests run before
+    # gotestsum artefact uploads, Cat9k run before Argo scenario logs
+    # are emitted).
+    unit_stats: dict[str, dict[str, int]] = {}
+    unit_run_id = None
+    if (s := latest.get("lab-ci / unit-tests")):
+        unit_run_id = run_id_from_target_url(s.get("target_url", ""))
+    if unit_run_id:
+        content = fetch_artefact_file(
+            fork_repo, unit_run_id, "unit-test-results", "test-output.json"
+        )
+        if content:
+            unit_stats = parse_gotestsum_json(content)
+
+    def scenario_markers_for(ctx: str) -> dict[tuple[str, str], dict[str, Any]]:
+        s = latest.get(ctx)
+        if not s:
+            return {}
+        run_id = run_id_from_target_url(s.get("target_url", ""))
+        if not run_id:
+            return {}
+        return parse_scenario_markers(fetch_job_log_text(fork_repo, run_id))
+
+    cat8kv_markers = scenario_markers_for("lab-ci / cat8kv")
+    cat9k_markers = scenario_markers_for("lab-ci / cat9k")
+
+    lines.extend(render_crd_coverage(unit_stats, cat8kv_markers, cat9k_markers))
 
     # Per-workflow step breakdown
     for ctx, emoji, label in CONTEXTS:
