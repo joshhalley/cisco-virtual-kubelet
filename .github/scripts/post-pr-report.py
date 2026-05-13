@@ -121,13 +121,16 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"::warning::post-pr-report: {msg}\n")
 
 
-def api(path: str, method: str = "GET", body: dict | None = None) -> Any:
-    """Minimal GitHub API call. Returns parsed JSON (or None on 204)."""
+def api(path: str, method: str = "GET", body: dict | None = None, token: str | None = None) -> Any:
+    """Minimal GitHub API call. Returns parsed JSON (or None on 204).
+    `token` overrides the default GH_TOKEN — used for fork-internal
+    reads that need `actions: read` (artefacts, job-logs).
+    """
     url = path if path.startswith("http") else f"{GITHUB_API}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Accept", "application/vnd.github+json")
-    req.add_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+    req.add_header("Authorization", f"Bearer {token or os.environ['GH_TOKEN']}")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
     if data:
         req.add_header("Content-Type", "application/json")
@@ -178,12 +181,27 @@ def fetch_steps(fork_repo: str, run_id: int) -> list[dict]:
     return jobs[0].get("steps", [])
 
 
-def http_get_bytes(url: str) -> bytes | None:
-    """Authenticated GET returning raw response body. None on any error."""
+def _fork_read_token() -> str:
+    """Token used for fork-internal read APIs (artefacts, job logs).
+    Defaults to GH_TOKEN — backwards compatible — but workflows that
+    set FORK_READ_TOKEN to the auto-issued GITHUB_TOKEN get the
+    necessary `actions: read` permission that the upstream-PAT
+    (public_repo scope only) lacks.
+    """
+    return os.environ.get("FORK_READ_TOKEN") or os.environ["GH_TOKEN"]
+
+
+def http_get_bytes(url: str, token: str | None = None) -> bytes | None:
+    """Authenticated GET returning raw response body. None on any error.
+
+    `token` overrides the default GH_TOKEN — used to swap in the
+    workflow's GITHUB_TOKEN for fork-internal calls that need
+    `actions: read`.
+    """
     try:
         req = urllib.request.Request(url, method="GET")
         req.add_header("Accept", "application/vnd.github+json")
-        req.add_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+        req.add_header("Authorization", f"Bearer {token or os.environ['GH_TOKEN']}")
         req.add_header("X-GitHub-Api-Version", "2022-11-28")
         with urllib.request.urlopen(req, timeout=60) as resp:
             return resp.read()
@@ -198,9 +216,14 @@ def fetch_job_log_text(fork_repo: str, run_id: int) -> str:
     Used to grep ::cvk-scenario:: markers out of the Argo workflow
     output without depending on the artefact upload step (which the
     lab-ci workflows only do on failure today).
+
+    Job-log API requires `actions: read` on the fork — uses
+    FORK_READ_TOKEN (the workflow's auto-issued GITHUB_TOKEN) rather
+    than the upstream-write PAT which is scoped to public_repo only.
     """
+    token = _fork_read_token()
     try:
-        data = api(f"/repos/{fork_repo}/actions/runs/{run_id}/jobs") or {}
+        data = api(f"/repos/{fork_repo}/actions/runs/{run_id}/jobs", token=token) or {}
     except urllib.error.HTTPError as e:
         warn(f"fetch jobs {run_id}: {e}")
         return ""
@@ -209,7 +232,10 @@ def fetch_job_log_text(fork_repo: str, run_id: int) -> str:
         job_id = job.get("id")
         if not job_id:
             continue
-        body = http_get_bytes(f"{GITHUB_API}/repos/{fork_repo}/actions/jobs/{job_id}/logs")
+        body = http_get_bytes(
+            f"{GITHUB_API}/repos/{fork_repo}/actions/jobs/{job_id}/logs",
+            token=token,
+        )
         if body:
             pieces.append(body.decode("utf-8", errors="replace"))
     return "\n".join(pieces)
@@ -218,19 +244,20 @@ def fetch_job_log_text(fork_repo: str, run_id: int) -> str:
 def fetch_artefact_file(fork_repo: str, run_id: int, artefact_name: str, file_in_zip: str) -> bytes | None:
     """Download a single file out of a named workflow artefact zip.
 
-    The GitHub artefacts API returns a redirect to a temporary signed
-    URL; urllib follows it automatically when authenticated. Returns
-    None on any failure — the report degrades gracefully.
+    The GitHub artefacts API requires `actions: read` on the fork and
+    redirects to a temporary signed S3 URL. Uses FORK_READ_TOKEN for
+    the same reason fetch_job_log_text does.
     """
+    token = _fork_read_token()
     try:
-        listing = api(f"/repos/{fork_repo}/actions/runs/{run_id}/artifacts") or {}
+        listing = api(f"/repos/{fork_repo}/actions/runs/{run_id}/artifacts", token=token) or {}
     except urllib.error.HTTPError as e:
         warn(f"list artefacts {run_id}: {e}")
         return None
     for art in listing.get("artifacts", []):
         if art.get("name") != artefact_name:
             continue
-        zip_bytes = http_get_bytes(art.get("archive_download_url", ""))
+        zip_bytes = http_get_bytes(art.get("archive_download_url", ""), token=token)
         if not zip_bytes:
             return None
         try:
