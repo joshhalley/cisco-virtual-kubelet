@@ -57,26 +57,26 @@ CAT8KV_DEVICE_HOSTS = {
 # Used only for report presentation and as a fallback for legacy marker
 # logs that do not carry Argo node input parameters.
 CAT8KV_SCENARIO_DEVICE = {
-    "primary": "16",
-    "restart-resilience": "16",
-    "multi-container": "16",
-    "concurrent-pods": "17",
-    "iosxeconfig-rev": "18",
-    "tenancy": "18",
-    "show-command": "19",
-    "allowlist": "19",
-    "output-spill": "19",
-    "clobber-existing": "19",
+    "primary": "17",
+    "restart-resilience": "17",
+    "multi-container": "17",
+    "concurrent-pods": "18",
+    "iosxeconfig-rev": "19",
+    "tenancy": "19",
+    "show-command": "16",
+    "allowlist": "16",
+    "output-spill": "16",
+    "clobber-existing": "16",
     "subscribe": "20",
     "concurrent-stress": "20",
 }
 
 CAT8KV_SHARD_LABEL = {
     "15": "excluded/17.9.8",
-    "16": "primary/restart/multi",
-    "17": "concurrent-pods",
-    "18": "config/tenancy",
-    "19": "device-ops",
+    "16": "device-ops",
+    "17": "primary/restart/multi",
+    "18": "concurrent-pods",
+    "19": "config/tenancy",
     "20": "telemetry/stress",
 }
 
