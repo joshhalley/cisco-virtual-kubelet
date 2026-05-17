@@ -57,8 +57,8 @@ CAT8KV_DEVICE_HOSTS = {
 # Used only for report presentation and as a fallback for legacy marker
 # logs that do not carry Argo node input parameters.
 CAT8KV_SCENARIO_DEVICE = {
-    "primary": "15",
-    "restart-resilience": "15",
+    "primary": "16",
+    "restart-resilience": "16",
     "multi-container": "16",
     "concurrent-pods": "17",
     "iosxeconfig-rev": "18",
@@ -72,8 +72,8 @@ CAT8KV_SCENARIO_DEVICE = {
 }
 
 CAT8KV_SHARD_LABEL = {
-    "15": "primary/restart",
-    "16": "multi-container",
+    "15": "hygiene-only",
+    "16": "primary/restart/multi",
     "17": "concurrent-pods",
     "18": "config/tenancy",
     "19": "device-ops",
