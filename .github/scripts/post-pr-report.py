@@ -72,7 +72,7 @@ CAT8KV_SCENARIO_DEVICE = {
 }
 
 CAT8KV_SHARD_LABEL = {
-    "15": "hygiene-only",
+    "15": "excluded/17.9.8",
     "16": "primary/restart/multi",
     "17": "concurrent-pods",
     "18": "config/tenancy",
