@@ -39,6 +39,11 @@ CONTEXTS = [
     ("lab-ci / cat9k",      "🛰️",  "Cat9k (physical)"),
 ]
 
+LAB_EVIDENCE_ARTIFACTS = {
+    "lab-ci / cat8kv": "argo-evidence-cat8kv",
+    "lab-ci / cat9k": "argo-evidence-cat9k",
+}
+
 STATE_EMOJI = {
     "success": "✅",
     "failure": "❌",
@@ -121,13 +126,18 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"::warning::post-pr-report: {msg}\n")
 
 
-def api(path: str, method: str = "GET", body: dict | None = None) -> Any:
-    """Minimal GitHub API call. Returns parsed JSON (or None on 204)."""
+def api(path: str, method: str = "GET", body: dict | None = None, token: str | None = None) -> Any:
+    """Minimal GitHub API call. Returns parsed JSON (or None on 204).
+
+    `token` overrides GH_TOKEN for fork-internal reads such as
+    workflow logs and artefacts, which need actions:read permission
+    that the upstream-write PAT may not have.
+    """
     url = path if path.startswith("http") else f"{GITHUB_API}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Accept", "application/vnd.github+json")
-    req.add_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+    req.add_header("Authorization", f"Bearer {token or os.environ['GH_TOKEN']}")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
     if data:
         req.add_header("Content-Type", "application/json")
@@ -168,7 +178,10 @@ def run_id_from_target_url(url: str) -> int | None:
 def fetch_steps(fork_repo: str, run_id: int) -> list[dict]:
     """Steps from the first (and only) job of a workflow run."""
     try:
-        data = api(f"/repos/{fork_repo}/actions/runs/{run_id}/jobs") or {}
+        data = api(
+            f"/repos/{fork_repo}/actions/runs/{run_id}/jobs",
+            token=_fork_read_token(),
+        ) or {}
     except urllib.error.HTTPError as e:
         warn(f"fetch jobs {run_id}: {e}")
         return []
@@ -178,12 +191,17 @@ def fetch_steps(fork_repo: str, run_id: int) -> list[dict]:
     return jobs[0].get("steps", [])
 
 
-def http_get_bytes(url: str) -> bytes | None:
+def _fork_read_token() -> str:
+    """Token used for fork-internal read APIs."""
+    return os.environ.get("FORK_READ_TOKEN") or os.environ["GH_TOKEN"]
+
+
+def http_get_bytes(url: str, token: str | None = None) -> bytes | None:
     """Authenticated GET returning raw response body. None on any error."""
     try:
         req = urllib.request.Request(url, method="GET")
         req.add_header("Accept", "application/vnd.github+json")
-        req.add_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+        req.add_header("Authorization", f"Bearer {token or os.environ['GH_TOKEN']}")
         req.add_header("X-GitHub-Api-Version", "2022-11-28")
         with urllib.request.urlopen(req, timeout=60) as resp:
             return resp.read()
@@ -199,8 +217,9 @@ def fetch_job_log_text(fork_repo: str, run_id: int) -> str:
     output without depending on the artefact upload step (which the
     lab-ci workflows only do on failure today).
     """
+    token = _fork_read_token()
     try:
-        data = api(f"/repos/{fork_repo}/actions/runs/{run_id}/jobs") or {}
+        data = api(f"/repos/{fork_repo}/actions/runs/{run_id}/jobs", token=token) or {}
     except urllib.error.HTTPError as e:
         warn(f"fetch jobs {run_id}: {e}")
         return ""
@@ -209,7 +228,10 @@ def fetch_job_log_text(fork_repo: str, run_id: int) -> str:
         job_id = job.get("id")
         if not job_id:
             continue
-        body = http_get_bytes(f"{GITHUB_API}/repos/{fork_repo}/actions/jobs/{job_id}/logs")
+        body = http_get_bytes(
+            f"{GITHUB_API}/repos/{fork_repo}/actions/jobs/{job_id}/logs",
+            token=token,
+        )
         if body:
             pieces.append(body.decode("utf-8", errors="replace"))
     return "\n".join(pieces)
@@ -222,15 +244,16 @@ def fetch_artefact_file(fork_repo: str, run_id: int, artefact_name: str, file_in
     URL; urllib follows it automatically when authenticated. Returns
     None on any failure — the report degrades gracefully.
     """
+    token = _fork_read_token()
     try:
-        listing = api(f"/repos/{fork_repo}/actions/runs/{run_id}/artifacts") or {}
+        listing = api(f"/repos/{fork_repo}/actions/runs/{run_id}/artifacts", token=token) or {}
     except urllib.error.HTTPError as e:
         warn(f"list artefacts {run_id}: {e}")
         return None
     for art in listing.get("artifacts", []):
         if art.get("name") != artefact_name:
             continue
-        zip_bytes = http_get_bytes(art.get("archive_download_url", ""))
+        zip_bytes = http_get_bytes(art.get("archive_download_url", ""), token=token)
         if not zip_bytes:
             return None
         try:
@@ -298,6 +321,69 @@ def parse_scenario_markers(text: str) -> dict[tuple[str, str], dict[str, Any]]:
             "phase": m.group("phase"),
             "duration": int(m.group("duration") or 0),
         }
+    return out
+
+
+def _duration_seconds(started: str | None, completed: str | None) -> int:
+    if not started or not completed:
+        return 0
+    from datetime import datetime
+    s = datetime.fromisoformat(started.replace("Z", "+00:00"))
+    e = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+    return max(0, int((e - s).total_seconds()))
+
+
+def parse_argo_scenarios(content: bytes) -> dict[tuple[str, str], dict[str, Any]]:
+    """Extract scenario status directly from an Argo workflow JSON dump."""
+    try:
+        workflow = json.loads(content)
+    except json.JSONDecodeError as e:
+        warn(f"parse argo workflow json: {e}")
+        return {}
+
+    templates = (
+        workflow.get("status", {})
+        .get("storedWorkflowTemplateSpec", {})
+        .get("templates", [])
+    )
+    labels_by_template: dict[str, dict[str, str]] = {}
+    for tmpl in templates:
+        name = tmpl.get("name")
+        if name:
+            labels_by_template[name] = tmpl.get("metadata", {}).get("labels", {}) or {}
+
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    nodes = workflow.get("status", {}).get("nodes", {}) or {}
+    for node in nodes.values():
+        if node.get("type") != "Pod":
+            continue
+        template_name = node.get("templateName") or ""
+        labels = labels_by_template.get(template_name, {})
+        scenario_name = labels.get("cvk.cisco.io/scenario-name")
+        crd = labels.get("cvk.cisco.io/crd")
+        if not scenario_name and not template_name.startswith("scenario-"):
+            continue
+
+        display_name = node.get("displayName") or node.get("name") or template_name
+        scenario_name = scenario_name or display_name
+        crd = crd or "Lab"
+        phase = (node.get("phase") or "unknown").lower()
+        key = (crd, scenario_name)
+        candidate = {
+            "crd": crd,
+            "name": scenario_name,
+            "phase": phase,
+            "duration": _duration_seconds(node.get("startedAt"), node.get("finishedAt")),
+            "template": template_name,
+            "displayName": display_name,
+            "message": node.get("message", ""),
+            "startedAt": node.get("startedAt", ""),
+            "source": "argo-workflow",
+        }
+
+        previous = out.get(key)
+        if not previous or candidate["startedAt"] >= previous.get("startedAt", ""):
+            out[key] = candidate
     return out
 
 
@@ -383,11 +469,79 @@ def fetch_run_duration(fork_repo: str, run_id: int) -> str:
     timing lives on the workflow run object as run_started_at → updated_at.
     """
     try:
-        run = api(f"/repos/{fork_repo}/actions/runs/{run_id}") or {}
+        run = api(
+            f"/repos/{fork_repo}/actions/runs/{run_id}",
+            token=_fork_read_token(),
+        ) or {}
     except urllib.error.HTTPError as e:
         warn(f"fetch run {run_id}: {e}")
         return ""
     return fmt_duration(run.get("run_started_at"), run.get("updated_at"))
+
+
+def scenario_results_for(
+    ctx: str,
+    latest: dict[str, dict],
+    fork_repo: str,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Return lab scenario results for a context.
+
+    New lab workflows upload Argo workflow JSON on both success and
+    failure. Prefer that durable source, then fall back to log markers
+    for older runs.
+    """
+    s = latest.get(ctx)
+    if not s:
+        return {}
+    run_id = run_id_from_target_url(s.get("target_url", ""))
+    if not run_id:
+        return {}
+
+    artifact_name = LAB_EVIDENCE_ARTIFACTS.get(ctx)
+    if artifact_name:
+        content = fetch_artefact_file(fork_repo, run_id, artifact_name, "argo-workflow.json")
+        if content:
+            scenarios = parse_argo_scenarios(content)
+            if scenarios:
+                return scenarios
+
+    return parse_scenario_markers(fetch_job_log_text(fork_repo, run_id))
+
+
+def render_lab_scenarios(scenarios: dict[tuple[str, str], dict[str, Any]]) -> list[str]:
+    if not scenarios:
+        return []
+
+    rows = sorted(
+        scenarios.values(),
+        key=lambda s: (s.get("startedAt", ""), s.get("crd", ""), s.get("name", "")),
+    )
+    lines: list[str] = []
+    lines.append("")
+    lines.append("**Argo scenarios**")
+    lines.append("")
+    lines.append("| CRD | Scenario | Template | Status | Duration |")
+    lines.append("| :--- | :--- | :--- | :---: | :---: |")
+    for row in rows:
+        phase = row.get("phase", "unknown")
+        icon = {
+            "succeeded": "✅",
+            "failed": "❌",
+            "error": "❌",
+            "running": "⏳",
+            "pending": "⏳",
+            "skipped": "⏭️",
+        }.get(phase, "❔")
+        duration = row.get("duration", 0)
+        msg = (row.get("message") or "").replace("|", "\\|")
+        status = f"{icon} `{phase}`"
+        if msg:
+            status += f"<br><sub>{msg}</sub>"
+        lines.append(
+            f"| `{row.get('crd', '-')}` | `{row.get('name', '-')}` | "
+            f"`{row.get('template', '-')}` | {status} | {duration}s |"
+        )
+    return lines
 
 
 def render_report(
@@ -459,17 +613,12 @@ def render_report(
         if content:
             unit_stats = parse_gotestsum_json(content)
 
-    def scenario_markers_for(ctx: str) -> dict[tuple[str, str], dict[str, Any]]:
-        s = latest.get(ctx)
-        if not s:
-            return {}
-        run_id = run_id_from_target_url(s.get("target_url", ""))
-        if not run_id:
-            return {}
-        return parse_scenario_markers(fetch_job_log_text(fork_repo, run_id))
-
-    cat8kv_markers = scenario_markers_for("lab-ci / cat8kv")
-    cat9k_markers = scenario_markers_for("lab-ci / cat9k")
+    lab_scenarios = {
+        ctx: scenario_results_for(ctx, latest, fork_repo)
+        for ctx in LAB_EVIDENCE_ARTIFACTS
+    }
+    cat8kv_markers = lab_scenarios.get("lab-ci / cat8kv", {})
+    cat9k_markers = lab_scenarios.get("lab-ci / cat9k", {})
 
     lines.extend(render_crd_coverage(unit_stats, cat8kv_markers, cat9k_markers))
 
@@ -482,29 +631,43 @@ def render_report(
         if not run_id:
             continue
         steps = fetch_steps(fork_repo, run_id)
+        scenarios = lab_scenarios.get(ctx, {})
         # Filter out skipped post-action steps to keep the table compact.
         visible = [st for st in steps if st.get("conclusion") != "skipped" or st.get("status") == "in_progress"]
-        if not visible:
+        if not visible and not scenarios:
             continue
         pass_n = sum(1 for st in visible if st.get("conclusion") == "success")
         fail_n = sum(1 for st in visible if st.get("conclusion") == "failure")
+        scen_pass_n = sum(1 for sc in scenarios.values() if sc.get("phase") == "succeeded")
+        scen_fail_n = sum(1 for sc in scenarios.values() if sc.get("phase") not in ("succeeded", "skipped"))
         state = s.get("state", "pending")
         hdr_emoji = STATE_EMOJI.get(state, "❔")
+        scenario_text = ""
+        if scenarios:
+            scenario_text = f", {scen_pass_n} scenarios passed, {scen_fail_n} failed"
         lines.append(
             f"<details><summary>{emoji} {label} — {hdr_emoji} "
-            f"{pass_n} passed, {fail_n} failed</summary>\n"
+            f"{pass_n} wrapper steps passed, {fail_n} failed{scenario_text}</summary>\n"
         )
-        lines.append("| # | Step | Status | Duration |")
-        lines.append("| ---: | :--- | :---: | :---: |")
-        for i, st in enumerate(visible, 1):
-            name = st.get("name", "?").replace("|", "\\|")
-            conclusion = st.get("conclusion") or st.get("status") or "?"
-            step_emoji = {
-                "success": "✅", "failure": "❌", "skipped": "⏭️",
-                "cancelled": "🚫", "in_progress": "⏳",
-            }.get(conclusion, "❔")
-            dur = fmt_duration(st.get("started_at"), st.get("completed_at"))
-            lines.append(f"| {i} | {name} | {step_emoji} | {dur or '—'} |")
+        lines.extend(render_lab_scenarios(scenarios))
+        if ctx in LAB_EVIDENCE_ARTIFACTS and not scenarios:
+            lines.append("")
+            lines.append("_No Argo scenario evidence was available for this run._")
+        if visible:
+            lines.append("")
+            lines.append("**GitHub wrapper steps**")
+            lines.append("")
+            lines.append("| # | Step | Status | Duration |")
+            lines.append("| ---: | :--- | :---: | :---: |")
+            for i, st in enumerate(visible, 1):
+                name = st.get("name", "?").replace("|", "\\|")
+                conclusion = st.get("conclusion") or st.get("status") or "?"
+                step_emoji = {
+                    "success": "✅", "failure": "❌", "skipped": "⏭️",
+                    "cancelled": "🚫", "in_progress": "⏳",
+                }.get(conclusion, "❔")
+                dur = fmt_duration(st.get("started_at"), st.get("completed_at"))
+                lines.append(f"| {i} | {name} | {step_emoji} | {dur or '—'} |")
         lines.append("\n</details>\n")
 
     lines.append("---")
