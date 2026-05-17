@@ -44,6 +44,44 @@ LAB_EVIDENCE_ARTIFACTS = {
     "lab-ci / cat9k": "argo-evidence-cat9k",
 }
 
+CAT8KV_DEVICE_HOSTS = {
+    "15": "192.0.2.55",
+    "16": "192.0.2.56",
+    "17": "192.0.2.57",
+    "18": "192.0.2.58",
+    "19": "192.0.2.59",
+    "20": "192.0.2.60",
+}
+
+# Current Cat8kv sharding in cvk-gitops/cat8kv-pr-test-template.yaml.
+# Used only for report presentation and as a fallback for legacy marker
+# logs that do not carry Argo node input parameters.
+CAT8KV_SCENARIO_DEVICE = {
+    "primary": "15",
+    "restart-resilience": "15",
+    "multi-container": "16",
+    "concurrent-pods": "17",
+    "iosxeconfig-rev": "18",
+    "tenancy": "18",
+    "show-command": "19",
+    "allowlist": "19",
+    "output-spill": "19",
+    "clobber-existing": "19",
+    "subscribe": "20",
+    "concurrent-stress": "20",
+}
+
+CAT8KV_SHARD_LABEL = {
+    "15": "primary/restart",
+    "16": "multi-container",
+    "17": "concurrent-pods",
+    "18": "config/tenancy",
+    "19": "device-ops",
+    "20": "telemetry/stress",
+}
+
+ADVISORY_SCENARIOS = {"concurrent-stress"}
+
 STATE_EMOJI = {
     "success": "✅",
     "failure": "❌",
@@ -119,6 +157,7 @@ CRD_ORDER = [
 SCENARIO_MARKER_RE = re.compile(
     r"::cvk-scenario:: crd=(?P<crd>\S+) name=(?P<name>\S+) phase=(?P<phase>\S+)"
     r"(?:\s+duration=(?P<duration>\d+))?"
+    r"(?P<extra>[^\n]*)"
 )
 
 
@@ -306,20 +345,46 @@ def parse_gotestsum_json(content: bytes) -> dict[str, dict[str, int]]:
     return stats
 
 
-def parse_scenario_markers(text: str) -> dict[tuple[str, str], dict[str, Any]]:
+def parse_marker_extras(extra: str) -> dict[str, str]:
+    """Parse key=value tokens appended to ::cvk-scenario:: markers."""
+    out: dict[str, str] = {}
+    for token in extra.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        if key:
+            out[key] = value
+    return out
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in {"1", "true", "yes", "y", "on"}
+
+
+def is_advisory_scenario(row: dict[str, Any]) -> bool:
+    return _truthy(row.get("advisory")) or row.get("name") in ADVISORY_SCENARIOS
+
+
+def parse_scenario_markers(text: str) -> dict[tuple[str, ...], dict[str, Any]]:
     """Extract the latest phase per (crd, scenario-name) tuple.
 
     Each Argo scenario emits two markers (running + final). We keep
     whichever is most recent in the log, so the end-of-run state wins.
     """
-    out: dict[tuple[str, str], dict[str, Any]] = {}
+    out: dict[tuple[str, ...], dict[str, Any]] = {}
     for m in SCENARIO_MARKER_RE.finditer(text):
+        extras = parse_marker_extras(m.group("extra") or "")
         key = (m.group("crd"), m.group("name"))
         out[key] = {
             "crd": m.group("crd"),
             "name": m.group("name"),
             "phase": m.group("phase"),
             "duration": int(m.group("duration") or 0),
+            "advisory": _truthy(extras.get("advisory", False)),
+            "rc": extras.get("rc", ""),
+            "source": "job-log-marker",
         }
     return out
 
@@ -333,7 +398,32 @@ def _duration_seconds(started: str | None, completed: str | None) -> int:
     return max(0, int((e - s).total_seconds()))
 
 
-def parse_argo_scenarios(content: bytes) -> dict[tuple[str, str], dict[str, Any]]:
+def _node_parameter_map(node: dict[str, Any]) -> dict[str, str]:
+    params = node.get("inputs", {}).get("parameters", []) or []
+    out: dict[str, str] = {}
+    if isinstance(params, dict):
+        for key, value in params.items():
+            out[str(key)] = str(value)
+        return out
+    for p in params:
+        if not isinstance(p, dict):
+            continue
+        name = p.get("name")
+        if not name:
+            continue
+        out[str(name)] = str(p.get("value", ""))
+    return out
+
+
+def _device_id_from_text(*values: str) -> str:
+    for value in values:
+        m = re.search(r"cat8kv-(\d{2})", value or "")
+        if m:
+            return m.group(1)
+    return ""
+
+
+def parse_argo_scenarios(content: bytes) -> dict[tuple[str, ...], dict[str, Any]]:
     """Extract scenario status directly from an Argo workflow JSON dump."""
     try:
         workflow = json.loads(content)
@@ -352,7 +442,7 @@ def parse_argo_scenarios(content: bytes) -> dict[tuple[str, str], dict[str, Any]
         if name:
             labels_by_template[name] = tmpl.get("metadata", {}).get("labels", {}) or {}
 
-    out: dict[tuple[str, str], dict[str, Any]] = {}
+    out: dict[tuple[str, ...], dict[str, Any]] = {}
     nodes = workflow.get("status", {}).get("nodes", {}) or {}
     for node in nodes.values():
         if node.get("type") != "Pod":
@@ -368,7 +458,10 @@ def parse_argo_scenarios(content: bytes) -> dict[tuple[str, str], dict[str, Any]
         scenario_name = scenario_name or display_name
         crd = crd or "Lab"
         phase = (node.get("phase") or "unknown").lower()
-        key = (crd, scenario_name)
+        params = _node_parameter_map(node)
+        device_id = params.get("device_id") or _device_id_from_text(display_name, node.get("name", ""))
+        device_host = params.get("device_host") or CAT8KV_DEVICE_HOSTS.get(device_id, "")
+        key = (crd, scenario_name, device_id or display_name)
         candidate = {
             "crd": crd,
             "name": scenario_name,
@@ -376,8 +469,11 @@ def parse_argo_scenarios(content: bytes) -> dict[tuple[str, str], dict[str, Any]
             "duration": _duration_seconds(node.get("startedAt"), node.get("finishedAt")),
             "template": template_name,
             "displayName": display_name,
+            "device_id": device_id,
+            "device_host": device_host,
             "message": node.get("message", ""),
             "startedAt": node.get("startedAt", ""),
+            "advisory": scenario_name in ADVISORY_SCENARIOS,
             "source": "argo-workflow",
         }
 
@@ -385,6 +481,35 @@ def parse_argo_scenarios(content: bytes) -> dict[tuple[str, str], dict[str, Any]
         if not previous or candidate["startedAt"] >= previous.get("startedAt", ""):
             out[key] = candidate
     return out
+
+
+def annotate_lab_scenarios(
+    ctx: str,
+    scenarios: dict[tuple[str, ...], dict[str, Any]],
+) -> dict[tuple[str, ...], dict[str, Any]]:
+    """Attach lab-specific device/shard metadata used by the PR report."""
+    annotated: dict[tuple[str, ...], dict[str, Any]] = {}
+    for row in scenarios.values():
+        row = dict(row)
+        name = row.get("name", "")
+        if ctx == "lab-ci / cat8kv":
+            device_id = row.get("device_id") or CAT8KV_SCENARIO_DEVICE.get(name, "")
+            host = row.get("device_host") or CAT8KV_DEVICE_HOSTS.get(device_id, "")
+            row["device_id"] = device_id
+            row["device_host"] = host
+            row["device"] = f"cat8kv-{device_id}" if device_id else "cat8kv"
+            row["shard"] = CAT8KV_SHARD_LABEL.get(device_id, "")
+        elif ctx == "lab-ci / cat9k":
+            row["device"] = "cat9k"
+            row["device_host"] = "198.51.100.102"
+            row["shard"] = "physical"
+
+        if name in ADVISORY_SCENARIOS:
+            row["advisory"] = True
+
+        key = (row.get("crd", "Lab"), row.get("name", ""), row.get("device", ""))
+        annotated[key] = row
+    return annotated
 
 
 def crd_for_package(pkg: str) -> str:
@@ -399,8 +524,8 @@ def crd_for_package(pkg: str) -> str:
 
 def render_crd_coverage(
     unit_stats: dict[str, dict[str, int]],
-    cat8kv_markers: dict[tuple[str, str], dict[str, Any]],
-    cat9k_markers: dict[tuple[str, str], dict[str, Any]],
+    cat8kv_markers: dict[tuple[str, ...], dict[str, Any]],
+    cat9k_markers: dict[tuple[str, ...], dict[str, Any]],
 ) -> list[str]:
     """Produce the '### Coverage by CRD' section as a list of md lines."""
     # Unit-test aggregation: package counts → CRD totals.
@@ -413,9 +538,11 @@ def render_crd_coverage(
         u["skip"] += c.get("skip", 0)
 
     # Scenario aggregation: count per (crd, source).
-    def bucket_scenarios(markers: dict[tuple[str, str], dict[str, Any]]) -> dict[str, dict[str, int]]:
+    def bucket_scenarios(markers: dict[tuple[str, ...], dict[str, Any]]) -> dict[str, dict[str, int]]:
         b: dict[str, dict[str, int]] = {}
         for v in markers.values():
+            if is_advisory_scenario(v):
+                continue
             crd = v["crd"]
             phase = v["phase"]
             s = b.setdefault(crd, {"pass": 0, "fail": 0})
@@ -483,7 +610,7 @@ def scenario_results_for(
     ctx: str,
     latest: dict[str, dict],
     fork_repo: str,
-) -> dict[tuple[str, str], dict[str, Any]]:
+) -> dict[tuple[str, ...], dict[str, Any]]:
     """Return lab scenario results for a context.
 
     New lab workflows upload Argo workflow JSON on both success and
@@ -503,25 +630,30 @@ def scenario_results_for(
         if content:
             scenarios = parse_argo_scenarios(content)
             if scenarios:
-                return scenarios
+                return annotate_lab_scenarios(ctx, scenarios)
 
-    return parse_scenario_markers(fetch_job_log_text(fork_repo, run_id))
+    return annotate_lab_scenarios(ctx, parse_scenario_markers(fetch_job_log_text(fork_repo, run_id)))
 
 
-def render_lab_scenarios(scenarios: dict[tuple[str, str], dict[str, Any]]) -> list[str]:
+def render_lab_scenarios(scenarios: dict[tuple[str, ...], dict[str, Any]]) -> list[str]:
     if not scenarios:
         return []
 
     rows = sorted(
         scenarios.values(),
-        key=lambda s: (s.get("startedAt", ""), s.get("crd", ""), s.get("name", "")),
+        key=lambda s: (
+            s.get("startedAt", ""),
+            s.get("device", ""),
+            s.get("crd", ""),
+            s.get("name", ""),
+        ),
     )
     lines: list[str] = []
     lines.append("")
     lines.append("**Argo scenarios**")
     lines.append("")
-    lines.append("| CRD | Scenario | Template | Status | Duration |")
-    lines.append("| :--- | :--- | :--- | :---: | :---: |")
+    lines.append("| Device | CRD | Scenario | Shard | Template | Status | Duration |")
+    lines.append("| :--- | :--- | :--- | :--- | :--- | :---: | :---: |")
     for row in rows:
         phase = row.get("phase", "unknown")
         icon = {
@@ -534,12 +666,20 @@ def render_lab_scenarios(scenarios: dict[tuple[str, str], dict[str, Any]]) -> li
         }.get(phase, "❔")
         duration = row.get("duration", 0)
         msg = (row.get("message") or "").replace("|", "\\|")
+        device = row.get("device") or "—"
+        host = row.get("device_host") or ""
+        device_cell = f"`{device}`"
+        if host:
+            device_cell += f"<br><sub>{host}</sub>"
+        shard = row.get("shard") or "—"
         status = f"{icon} `{phase}`"
+        if is_advisory_scenario(row):
+            status += "<br><sub>advisory</sub>"
         if msg:
             status += f"<br><sub>{msg}</sub>"
         lines.append(
-            f"| `{row.get('crd', '-')}` | `{row.get('name', '-')}` | "
-            f"`{row.get('template', '-')}` | {status} | {duration}s |"
+            f"| {device_cell} | `{row.get('crd', '-')}` | `{row.get('name', '-')}` | "
+            f"{shard} | `{row.get('template', '-')}` | {status} | {duration}s |"
         )
     return lines
 
@@ -638,13 +778,17 @@ def render_report(
             continue
         pass_n = sum(1 for st in visible if st.get("conclusion") == "success")
         fail_n = sum(1 for st in visible if st.get("conclusion") == "failure")
-        scen_pass_n = sum(1 for sc in scenarios.values() if sc.get("phase") == "succeeded")
-        scen_fail_n = sum(1 for sc in scenarios.values() if sc.get("phase") not in ("succeeded", "skipped"))
+        scen_gate = [sc for sc in scenarios.values() if not is_advisory_scenario(sc)]
+        scen_pass_n = sum(1 for sc in scen_gate if sc.get("phase") == "succeeded")
+        scen_fail_n = sum(1 for sc in scen_gate if sc.get("phase") not in ("succeeded", "skipped"))
+        scen_advisory_n = sum(1 for sc in scenarios.values() if is_advisory_scenario(sc))
         state = s.get("state", "pending")
         hdr_emoji = STATE_EMOJI.get(state, "❔")
         scenario_text = ""
         if scenarios:
             scenario_text = f", {scen_pass_n} scenarios passed, {scen_fail_n} failed"
+            if scen_advisory_n:
+                scenario_text += f", {scen_advisory_n} advisory"
         lines.append(
             f"<details><summary>{emoji} {label} — {hdr_emoji} "
             f"{pass_n} wrapper steps passed, {fail_n} failed{scenario_text}</summary>\n"

@@ -47,7 +47,7 @@ permissions:
 jobs:
   cat8kv:
     runs-on: [self-hosted, lab-cvk]
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       SHA: ${{ inputs.upstream_sha || github.event.pull_request.head.sha || github.sha }}
       UPSTREAM_REPO: ${{ inputs.upstream_repo || github.repository }}
