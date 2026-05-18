@@ -1,11 +1,40 @@
 # API Reference
 
-This page documents the two API surfaces you may interact with as a user or operator:
+This page documents the three API surfaces you may interact with as a user or operator:
 
-1. **Device-side RESTCONF** — the HTTP/JSON management API exposed by IOS-XE, which Cisco Virtual Kubelet uses to configure and observe App-Hosting. Useful to know about for troubleshooting with `curl`, and for understanding which YANG models are involved.
-2. **VK-side kubelet endpoints** — the HTTPS endpoints each VK pod exposes on `:10250`. These are what `kubectl top node`, metrics-server, and Prometheus talk to.
+1. **Kubernetes CRDs** — the supported operator API for inventory, Network as Code configuration, diagnostics, telemetry, read-only operations, write-class actions, and software upgrades. See the [CRD Reference](crds.md) for field-level usage and examples.
+2. **Device-side protocols** — RESTCONF, NETCONF, gNMI, and gNOI sessions from the provider to IOS-XE. RESTCONF endpoints are listed below because they are the most useful for app-hosting troubleshooting with `curl`.
+3. **VK-side kubelet endpoints** — the HTTPS endpoints each VK pod exposes on `:10250`. These are what `kubectl top node`, metrics-server, and Prometheus talk to.
 
 You don't normally call RESTCONF by hand — the VK does it on your behalf as pods are created and deleted — but the reference below is accurate for manual debugging (see [Testing with curl](#testing-with-curl) at the bottom).
+
+```mermaid
+flowchart LR
+  Operator["kubectl / GitOps"] --> CRDs["Cisco Virtual Kubelet CRDs"]
+  CRDs --> Controllers["manager and per-device VK controllers"]
+  Controllers --> RESTCONF["RESTCONF app-hosting lifecycle"]
+  Controllers --> Config["RESTCONF, NETCONF, or gNMI config transport"]
+  Controllers --> GNOI["gNOI operations and upgrades"]
+  Controllers --> Kubelet["VK :10250 kubelet API"]
+  RESTCONF --> IOSXE["IOS-XE"]
+  Config --> IOSXE
+  GNOI --> IOSXE
+  Kubelet --> Kubernetes["metrics-server / Prometheus / kubectl"]
+```
+
+## Kubernetes CRDs
+
+The preferred user API is Kubernetes-native. Apply CRDs, inspect status, and
+read events:
+
+```bash
+kubectl get cvk,iosxecfg,devop,xeop,xeupgrade -A
+kubectl describe cvk <device-name>
+kubectl get events --sort-by=.lastTimestamp
+```
+
+The full CRD inventory, architectural flow, sample YAML, and sample CLI output
+are in [CRD Reference](crds.md).
 
 ## Device side — RESTCONF
 

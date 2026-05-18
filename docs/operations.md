@@ -2,6 +2,19 @@
 
 `DeviceOperation` is the sibling-CRD path for auditable, asynchronous, non-Pod operations.
 
+```mermaid
+flowchart LR
+  Operator["Operator or automation"] --> ReadOnly["DeviceOperation"]
+  Operator --> Action["IOSXEOperationalAction"]
+  Operator --> Upgrade["IOSXESoftwareUpgrade"]
+  ReadOnly --> Safe["Read-only command and gNOI probes"]
+  Action --> Write["One-shot write-class gNOI RPC"]
+  Upgrade --> UpgradeFlow["OS install, activate, verify, rollback"]
+  Safe --> Device["IOS-XE device"]
+  Write --> Device
+  UpgradeFlow --> Device
+```
+
 ```yaml
 apiVersion: ops.cisco.vk/v1alpha1
 kind: DeviceOperation
@@ -51,6 +64,32 @@ truncated preview in `.status.outputs[].output` and records
 `.status.artifactURIs[]` as `configmap://<namespace>/<name>/<key>`, for example
 `configmap://default/capture-output/output`. Captures larger than 900 KiB are
 rejected with `Ready=False, reason=ArtifactTooLarge`.
+
+Read-only gNOI kinds use the same CRD/status machinery:
+
+| Kind | gNOI service | Typical use |
+|---|---|---|
+| `GNOIPing` | System | Reachability probe from the device. |
+| `GNOITraceroute` | System | Hop-by-hop path check from the device. |
+| `GNOITime` | System | Device clock check. |
+| `GNOIFileGet` | File | Read a bounded file preview or spill to ConfigMap. |
+| `GNOIFileStat` | File | Validate staged files and metadata. |
+| `GNOICertGet` | Cert | List installed certificates. |
+| `GNOICanGenerateCSR` | Cert | Check CSR capability for a key/certificate profile. |
+| `GNOIRebootStatus` | System | Inspect pending or active reboot state. |
+| `GNOIOSVerify` | OS | Verify the current running version and activation state. |
+
+Example status:
+
+```bash
+$ kubectl get devop
+NAME                  DEVICE       KIND          PHASE       AGE
+show-version          cat9k-smoke  ShowCommand   Succeeded   2m
+flash-stat            cat9k-smoke  GNOIFileStat  Succeeded   45s
+
+$ kubectl get devop flash-stat -o jsonpath='{.status.outputs[0].output}'
+path=flash:cat9k_iosxe.17.18.02.SPA.bin size=1264332800
+```
 
 Write-class gNOI operations are implemented as a separate
 `IOSXEOperationalAction` CRD. They are disabled unless the per-device VK is
@@ -103,6 +142,17 @@ spec:
       message: "maintenance reload"
 ```
 
+```bash
+$ kubectl get xeop
+NAME                 DEVICE       KIND     PHASE       AGE
+reload-cat9k-smoke   cat9k-smoke  Reboot   Succeeded   7m
+
+$ kubectl get events --field-selector involvedObject.name=reload-cat9k-smoke
+LAST SEEN   TYPE     REASON      OBJECT                                      MESSAGE
+7m          Normal   Running     iosxeoperationalaction/reload-cat9k-smoke   Reboot dispatched for cat9k-smoke
+6m          Normal   Succeeded   iosxeoperationalaction/reload-cat9k-smoke   Reboot completed for cat9k-smoke
+```
+
 Lifecycle:
 
 - `Pending` action CRs are validated and marked `Running` before the gNOI RPC
@@ -140,6 +190,42 @@ If `rollbackOnFailure` is true and post-activation verification reports a
 different running version than the requested target, the reconciler enters
 `RollingBack`, re-activates the previously observed running version, and
 terminates as `RolledBack` once `OS.Verify` confirms that version.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Pending
+  Pending --> Resolving
+  Resolving --> Transferring
+  Transferring --> Validating
+  Transferring --> TransferInterrupted
+  TransferInterrupted --> Transferring
+  Validating --> Activating
+  Activating --> AwaitingReachability
+  AwaitingReachability --> Verifying
+  Verifying --> Succeeded
+  Verifying --> RollingBack
+  RollingBack --> RolledBack
+  Resolving --> PreflightFailed
+  Validating --> ValidationFailed
+  AwaitingReachability --> RebootTimeout
+  Transferring --> Failed
+  Verifying --> Failed
+```
+
+```bash
+$ kubectl get xeupgrade
+NAME                    DEVICE       TARGET     PHASE                 AGE
+cat9k-smoke-to-17-18    cat9k-smoke  17.18.02   AwaitingReachability  28m
+
+$ kubectl describe xeupgrade cat9k-smoke-to-17-18 | sed -n '/Conditions:/,/Events:/p'
+Conditions:
+  Type              Status  Reason
+  ImageResolved     True    LocalPathVerified
+  Transferred       True    StagedImagePresent
+  Validated         True    OSInstallValidated
+  Activated         True    ActivationMayHaveStarted
+  DeviceReachable   False   WaitingForGNXI
+```
 
 ## RBAC
 

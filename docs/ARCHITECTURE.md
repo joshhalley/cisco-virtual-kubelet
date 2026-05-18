@@ -157,14 +157,15 @@ fields, apply release-aware overrides, and emit `transport.Op` values addressed
 to IOS-XE YANG paths. The engine then validates and applies those operations
 over RESTCONF, NETCONF, or gNMI.
 
-```text
-IOSXEConfig / NetAsCode source
-  -> intent resolver
-  -> family writer
-  -> version override table
-  -> YANG validation boundary
-  -> transport
-  -> device
+```mermaid
+flowchart LR
+  Source["IOSXEConfig and NetAsCode source"] --> Resolver["Intent resolver"]
+  Resolver --> Writer["Family writer"]
+  Writer --> Override["Version override table"]
+  Override --> Validation["YANG validation boundary"]
+  Validation --> Transport["RESTCONF, NETCONF, or gNMI transport"]
+  Transport --> Device["IOS-XE device"]
+  Device --> Status["Status, revision, and apply log"]
 ```
 
 The validation boundary is deliberately device-facing. `CONFIG_YANG_VALIDATION`
@@ -448,14 +449,41 @@ separately by `--enable-iosxesoftwareupgrade` / Helm
 `gnoi.enableSoftwareUpgrade`, so read-only gNOI access does not
 implicitly enable reboot, factory-reset, file-write, or OS activation.
 
+```mermaid
+flowchart LR
+  DeviceOperation["DeviceOperation"] --> ReadOnly["Read-only reconciler"]
+  OperationalAction["IOSXEOperationalAction"] --> Action["Action reconciler"]
+  SoftwareUpgrade["IOSXESoftwareUpgrade"] --> Upgrade["Upgrade reconciler"]
+  ReadOnly --> Control["devicegrpc ClassControl"]
+  Action --> Control
+  Upgrade --> Bulk["devicegrpc ClassBulkTransfer"]
+  Upgrade --> Control
+  Control --> GNOI["gNOI client"]
+  Bulk --> GNOI
+  GNOI --> IOSXE["IOS-XE gNxI listener"]
+```
+
 **Software upgrade state machine** (IOSXESoftwareUpgrade):
 
-```
-Pending → Resolving → Transferring → Activating → AwaitingReachability → Verifying → Succeeded
-   │            │           │            │                 │                 │
-   ↓            ↓           ↓            ↓                 ↓                 ↓
-PreflightFailed │      TransferInterrupted ─┘         RebootTimeout       Failed
-              Failed                                                   (rollback pending)
+```mermaid
+stateDiagram-v2
+  [*] --> Pending
+  Pending --> Resolving
+  Resolving --> Transferring
+  Transferring --> Validating
+  Transferring --> TransferInterrupted
+  TransferInterrupted --> Transferring
+  Validating --> Activating
+  Activating --> AwaitingReachability
+  AwaitingReachability --> Verifying
+  Verifying --> Succeeded
+  Verifying --> RollingBack
+  RollingBack --> RolledBack
+  Resolving --> PreflightFailed
+  Transferring --> Failed
+  Validating --> ValidationFailed
+  AwaitingReachability --> RebootTimeout
+  Verifying --> Failed
 ```
 
 `OS.Activate` reboots the device itself per the gNOI spec; the
@@ -470,9 +498,8 @@ terminating as `RolledBack`.
 **IOS-XE capability matrix.** Per the IOS-XE 17.15 Programmability
 Guide, only OS, Cert, Bootstrapping, and FactoryReset are
 documented as supported services. System and File are wired but
-gated behind a runtime probe + `CiscoDevice.spec.capabilities.gnoi.services`
-opt-in; reconcilers fail fast with `*ErrServiceUnsupported` if the
-device returns `codes.Unimplemented`.
+gated behind runtime probes; reconcilers fail fast with
+`*ErrServiceUnsupported` if the device returns `codes.Unimplemented`.
 
 ## RESTCONF endpoints
 
