@@ -103,8 +103,31 @@ jobs:
         run: |
           set +e
           WORKFLOW="${{ steps.argo.outputs.workflow }}"
-          argo get -n virtual-kubelet-ci "$WORKFLOW" -o json > argo-workflow.json 2>argo-workflow.err
-          argo logs -n virtual-kubelet-ci "$WORKFLOW" > argo-logs.txt 2>&1
+          # Never persist the raw Workflow object or pod logs in a public
+          # Actions artifact: the stored WorkflowTemplate can contain lab
+          # implementation details and credential material. Whitelist only
+          # the node fields needed for triage.
+          argo get -n virtual-kubelet-ci "$WORKFLOW" -o json 2>argo-summary.err \
+            | jq '{
+                schema_version: 1,
+                workflow: {
+                  name: .metadata.name,
+                  phase: .status.phase,
+                  started_at: .status.startedAt,
+                  finished_at: .status.finishedAt
+                },
+                nodes: [
+                  .status.nodes[]?
+                  | select(.type == "Pod")
+                  | {
+                      display_name: (.displayName // .name),
+                      template_name: .templateName,
+                      phase: .phase,
+                      started_at: .startedAt,
+                      finished_at: .finishedAt
+                    }
+                ]
+              }' > argo-summary.json
           {
             echo "## Cat8kv Argo workflow"
             echo ""
@@ -118,25 +141,22 @@ jobs:
                   ((.finishedAt | fromdateiso8601) - (.startedAt | fromdateiso8601)) as $s
                   | if $s < 60 then "\($s|floor)s" else "\(($s/60)|floor)m\(($s%60)|floor|tostring|if length == 1 then "0"+. else . end)s" end
                 else " -" end;
-              .status.nodes
-              | to_entries
-              | map(.value)
-              | map(select(.type == "Pod"))
-              | sort_by(.startedAt // "")
+              .nodes
+              | sort_by(.started_at // "")
               | .[]
-              | "| \(.displayName // .name) | \(.templateName // "-") | \(.phase // "-") | \(dur) |"
-            ' argo-workflow.json 2>/dev/null
+              | .startedAt = .started_at
+              | .finishedAt = .finished_at
+              | "| \(.display_name // "-") | \(.template_name // "-") | \(.phase // "-") | \(dur) |"
+            ' argo-summary.json 2>/dev/null
           } > argo-summary.md
           cat argo-summary.md >> "$GITHUB_STEP_SUMMARY"
-          head -200 argo-logs.txt
       - uses: actions/upload-artifact@v4
         if: always() && steps.argo.outputs.workflow != ''
         with:
           name: argo-evidence-cat8kv
           path: |
-            argo-workflow.json
-            argo-workflow.err
-            argo-logs.txt
+            argo-summary.json
+            argo-summary.err
             argo-summary.md
           if-no-files-found: warn
           retention-days: 14
