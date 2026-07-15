@@ -92,7 +92,7 @@ jobs:
             -o name | sed 's|^workflow.argoproj.io/||')
           echo "workflow=$NAME" >> "$GITHUB_OUTPUT"
           echo "Submitted: $NAME"
-          argo watch -n virtual-kubelet-ci "$NAME"
+          argo wait -n virtual-kubelet-ci "$NAME" >/dev/null 2>&1 || true
           PHASE=$(argo get -n virtual-kubelet-ci "$NAME" -o json | jq -r '.status.phase')
           echo "phase=$PHASE" >> "$GITHUB_OUTPUT"
           [ "$PHASE" = "Succeeded" ]
